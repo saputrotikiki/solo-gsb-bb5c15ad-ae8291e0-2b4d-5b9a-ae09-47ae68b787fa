@@ -17,6 +17,7 @@
     </div>
     <div class="actions">
       <button id="btnSample" type="button" class="btn btn-ghost">载入示例</button>
+      <button id="btnSampleIncompatible" type="button" class="btn btn-ghost" title="载入禁配装箱模式示例(总件数 ≤ 10)">载入禁配示例</button>
       <button id="btnPlan" type="button" class="btn btn-primary">▶ 生成分箱方案</button>
       <button id="btnAssess" type="button" class="btn btn-assess">🛡 容灾评估</button>
     </div>
@@ -45,6 +46,12 @@
         <input type="checkbox" id="useSegments" />
         启用分段运输:按顺序维护各运输段的时长与可用温区,规划时逐段校验
         <small>(总运输时长 = 各段时长之和)</small>
+      </label>
+
+      <label class="seg-toggle incompatible-toggle">
+        <input type="checkbox" id="useIncompatible" />
+        🚫 启用禁配装箱模式:总件数限 1~10,按件精确求解最少箱数方案;货物行可填写不可同箱的其他批号
+        <small>(当前列表序号,逗号分隔;单向填写视为双方禁配;非法批号或自身引用将被拒绝;同批可逐件拆箱)</small>
       </label>
 
       <div id="singleZoneSection">
@@ -83,7 +90,8 @@
               <th>首选下限 ℃<br><small>(可选)</small></th>
               <th>首选上限 ℃<br><small>(可选)</small></th>
               <th>度时预算 ℃·h<br><small>(留空不限)</small></th>
-              <th>最长运输 h<br><small>(留空不限)</small></th><th></th>
+              <th>最长运输 h<br><small>(留空不限)</small></th>
+              <th class="incompatible-col">不可同箱批号<br><small>(禁配模式;序号,逗号分隔)</small></th><th></th>
             </tr>
           </thead>
           <tbody id="cargoRows"></tbody>
@@ -99,6 +107,8 @@
 
       <div id="resultView" hidden>
         <h2>规划结果</h2>
+        <div id="incompatibleBanner" class="incompatible-banner" hidden></div>
+        <div id="noSolution" class="no-solution" hidden></div>
         <div id="summary" class="summary"></div>
 
         <h3>分箱方案 <span id="boxCount" class="muted"></span></h3>

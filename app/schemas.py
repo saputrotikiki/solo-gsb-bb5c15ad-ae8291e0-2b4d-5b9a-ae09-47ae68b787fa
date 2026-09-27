@@ -1,9 +1,9 @@
 """Pydantic 请求模型(同时用于 /docs 中的接口文档)。"""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ZoneIn(BaseModel):
@@ -47,6 +47,20 @@ class CargoIn(BaseModel):
     max_transport_hours: float | None = Field(
         None, ge=0, description="该批货物可承受的最长运输时长(小时),留空表示不限"
     )
+    incompatible_with: str | None = Field(
+        None,
+        description="禁配装箱模式专用:不可与本批同箱的其他批号(当前货物列表"
+        "序号,1 起,逗号分隔,如「2,3」);单向填写视为双方禁配;非法批号或"
+        "自身引用将被拒绝;未启用禁配模式时忽略。也接受字符串数组形式",
+    )
+
+    @field_validator("incompatible_with", mode="before")
+    @classmethod
+    def _normalize_incompatible_with(cls, v: Any) -> Any:
+        """允许以字符串数组形式提交禁配批号,统一规整为逗号分隔字符串。"""
+        if isinstance(v, (list, tuple)):
+            return ",".join(str(x).strip() for x in v)
+        return v
 
 
 class PlanRequest(BaseModel):
@@ -69,6 +83,15 @@ class PlanRequest(BaseModel):
         "提供后启用分段温区校验,并忽略 zones",
     )
     cargoes: list[CargoIn] = Field(..., min_length=1, description="货物批次列表")
+    incompatible_mode: bool = Field(
+        False,
+        description="是否启用禁配装箱模式:启用后总件数限 1~10,货物行可填不可"
+        "同箱的其他批号(列表序号,逗号分隔,单向视为双方禁配,非法批号/自身"
+        "引用拒绝);同批允许逐件拆箱,任何箱不得同时装入禁配双方,并仍须通过"
+        "容量、逐段温区、锁温组与度时预算校验;存在全员装载方案时返回箱数最少"
+        "且箱号序列字典序最小者,无解时明确提示且不返回部分方案。"
+        "false(默认)时保留原 FFD 规划",
+    )
 
 
 class ReviewRequest(BaseModel):

@@ -134,6 +134,8 @@ def _run_scenario(
         return {
             **head,
             "transportable": newly_units == 0,
+            # 禁配装箱模式要求全员装载;有批次未装即无可行方案
+            "feasible": newly_units == 0,
             "boxes_used": 0,
             "extra_boxes": -base_summary["boxes_used"],
             "loaded_units": 0,
@@ -154,15 +156,21 @@ def _run_scenario(
     s_summary = result["summary"]
     newly = _newly_unloaded(baseline_loaded, _loaded_units_by_batch(result), names)
     newly_units = sum(n["units"] for n in newly)
+    feasible = bool(result.get("feasible", True)) and newly_units == 0
+    reason = _first_new_conflict(result, newly)
+    if reason is None and not feasible:
+        # 禁配装箱模式无部分方案,unloaded 为空,原因在 infeasible_reason
+        reason = result.get("infeasible_reason")
     return {
         **head,
         "transportable": newly_units == 0,
+        "feasible": feasible,
         "boxes_used": s_summary["boxes_used"],
         "extra_boxes": s_summary["boxes_used"] - base_summary["boxes_used"],
         "loaded_units": s_summary["loaded_units"],
         "newly_unloaded": newly,
         "newly_unloaded_units": newly_units,
-        "first_conflict_reason": _first_new_conflict(result, newly),
+        "first_conflict_reason": reason,
     }
 
 
@@ -171,6 +179,13 @@ def assess_zone_failures(payload: dict[str, Any]) -> dict[str, Any]:
     # 基准方案:与 /api/plan 完全相同的规则,且评估过程不修改该结果
     baseline = plan(payload)
     base_summary = baseline["summary"]
+
+    # 禁配装箱模式要求全员装载:基准本身无解时不存在可评估的运输方案
+    if base_summary.get("incompatible_mode") and not baseline.get("feasible", True):
+        raise ValueError(
+            f"当前禁配装箱模式的基准规划即无全员装载方案,无法进行容灾评估:"
+            f"{baseline.get('infeasible_reason') or '存在无法装载的批次'}"
+        )
 
     scenarios = [
         _run_scenario(payload, baseline, seg, zone_idx)
@@ -197,6 +212,8 @@ def assess_zone_failures(payload: dict[str, Any]) -> dict[str, Any]:
             "all_transportable": base_summary["all_transportable"],
             "transport_hours": base_summary["transport_hours"],
             "segment_mode": base_summary["segment_mode"],
+            "incompatible_mode": base_summary.get("incompatible_mode", False),
+            "feasible": baseline.get("feasible", True),
         },
         "scenarios": scenarios,
         "summary": {
@@ -207,6 +224,9 @@ def assess_zone_failures(payload: dict[str, Any]) -> dict[str, Any]:
                 (s["newly_unloaded_units"] for s in scenarios), default=0
             ),
             "max_extra_boxes": max((s["extra_boxes"] for s in scenarios), default=0),
+            "incompatible_mode": base_summary.get("incompatible_mode", False),
         },
+        "incompatible_mode": base_summary.get("incompatible_mode", False),
+        "forbidden_pairs": baseline.get("forbidden_pairs", []),
         "volume_unit": baseline["volume_unit"],
     }

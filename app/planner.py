@@ -18,9 +18,16 @@
   共享设定点取自各段可行温度段(可能不连续)交集保留的真实区间,结合组前
   累计热暴露,选取使整组结束时箱内最大预算使用率最低的点,平局取较低温度;
   交集为空(不存在共享设定点)时该装箱组合不可用,并报告首个失败组及涉及段。
+- 支持禁配装箱模式(incompatible_mode):启用后总件数限 1~10,货物行可填写
+  不可同箱的其他批号(当前列表序号,逗号分隔;单向填写视为双方禁配;非法批号
+  或自身引用直接拒绝)。同批允许逐件拆箱,任何箱不得同时装入禁配双方,且仍须
+  通过容量、逐段温区、锁温组与度时预算全部校验。此时不再使用 FFD 启发式,
+  而是在最大箱数约束内做精确搜索:存在全员装载方案时必返回箱数最少者,
+  箱号按首次出现编号,并列时取"按输入批次逐件顺序组成的箱号序列"字典序最小者;
+  无解时明确提示且不返回任何部分方案。未启用时完全保留原规划逻辑。
 - 同一批货物可按"件"为最小单位拆分到多个箱子。
-- 采用 First-Fit-Decreasing 启发式:温度下限越低(要求越苛刻)的批次优先,
-  同温限按总体积降序;依次塞入已有箱子,放不下再开新箱。
+- 未启用禁配模式时采用 First-Fit-Decreasing 启发式:温度下限越低(要求越苛刻)
+  的批次优先,同温限按总体积降序;依次塞入已有箱子,放不下再开新箱。
 """
 from __future__ import annotations
 
@@ -177,12 +184,26 @@ class _Box:
     feasible: _Iv | None = None
     # 箱内批次(按批号去重),用于热暴露核算
     lots: list["_Batch"] = field(default_factory=list)
-    # 最近一次 try_load 失败原因:capacity / temp / lock / budget
+    # 禁配装箱模式:不可同箱的批号对(双方对称);任一已在箱内即拒绝对方
+    forbidden: frozenset[tuple[int, int]] = frozenset()
+    # 最近一次 try_load 失败原因:capacity / temp / lock / budget / forbidden
     last_fail: str | None = None
+
+    def _forbidden(self, batch_no: int) -> bool:
+        """该批是否与箱内任一批次构成禁配(同批自身不算禁配,可逐件拆箱)。"""
+        return any(
+            (a == batch_no and lot.no == b) or (b == batch_no and lot.no == a)
+            for a, b in self.forbidden
+            for lot in self.lots
+        )
 
     def try_load(self, batch: "_Batch", iv: _Iv) -> bool:
         """尝试装入 1 件货物,成功则更新箱内温度交集与容量。"""
         self.last_fail = None
+        # 禁配双方不得同箱(同批可逐件拆入本箱,不与自身构成禁配)
+        if self._forbidden(batch.no):
+            self.last_fail = "forbidden"
+            return False
         if self.used + batch.unit_volume > self.capacity + EPS:
             self.last_fail = "capacity"
             return False
@@ -226,8 +247,14 @@ class _Box:
             self.lots.append(batch)
         return True
 
-    def can_take(self, iv: _Iv) -> bool:
-        """该箱是否在温区上能容纳此温度区间的货物(不考虑剩余容量)。"""
+    def can_take(self, iv: _Iv, batch_no: int | None = None) -> bool:
+        """该箱是否在温区上能容纳此温度区间的货物(不考虑剩余容量)。
+
+        batch_no 给出时还需通过禁配校验(禁配装箱模式)。
+        """
+        if batch_no is not None and self._forbidden(batch_no):
+            self.last_fail = "forbidden"
+            return False
         candidate = iv if self.feasible is None else self.feasible.intersect(iv)
         if candidate is None or _first_failed_segment(self.segments, candidate) is not None:
             self.last_fail = "temp"
@@ -356,6 +383,546 @@ def _parse_zones(raw_zones: list[dict[str, Any]], ctx: str) -> list[_Zone]:
     return zones
 
 
+# ---------------- 禁配装箱模式 ----------------
+
+# 启用禁配装箱模式时允许的总件数范围(精确搜索的规模上界)
+INCOMPATIBLE_MIN_UNITS = 1
+INCOMPATIBLE_MAX_UNITS = 10
+
+
+def parse_incompatible_declarations(
+    raw_cargoes: list[dict[str, Any]],
+) -> frozenset[tuple[int, int]]:
+    """解析各货物行的禁配批号声明(incompatible_with)。
+
+    每行可填当前列表序号(1 起),逗号(支持中文逗号/空白)分隔;单向填写
+    视为双方禁配。非法批号、非正整数或自身引用直接抛 ValueError。
+    返回规范化后的无序禁配对集合,每对满足 a < b。
+    """
+    n = len(raw_cargoes)
+    pairs: set[tuple[int, int]] = set()
+    for i, c in enumerate(raw_cargoes):
+        raw = c.get("incompatible_with")
+        if raw in (None, "", []):
+            continue
+        if isinstance(raw, (list, tuple)):
+            tokens = [str(x).strip() for x in raw]
+        else:
+            tokens = (
+                str(raw)
+                .replace(",", "，")
+                .replace("、", "，")
+                .replace(";", "，")
+                .replace("；", "，")
+                .replace(" ", "，")
+                .split("，")
+            )
+        no = i + 1
+        name = str(c.get("name") or f"批次 {no}")
+        for tok in tokens:
+            tok = tok.strip()
+            if not tok:
+                continue
+            if not (tok.lstrip("+").isdigit()):
+                raise ValueError(
+                    f"货物「{name}」(第 {no} 行)的不可同箱批号含非法序号 "
+                    f"{tok!r}:须为当前货物列表序号(1~{n} 的正整数),逗号分隔"
+                )
+            target = int(tok)
+            if target == no:
+                raise ValueError(
+                    f"货物「{name}」(第 {no} 行)的不可同箱批号不能引用自身"
+                    f"(序号 {no}),已拒绝"
+                )
+            if not 1 <= target <= n:
+                raise ValueError(
+                    f"货物「{name}」(第 {no} 行)声明的不可同箱批号 {target} "
+                    f"超出范围:当前共 {n} 批货物,序号须在 1~{n} 之间"
+                )
+            pairs.add((min(no, target), max(no, target)))
+    return frozenset(pairs)
+
+
+@dataclass
+class _Part:
+    """精确搜索中一个箱子的可变状态。"""
+
+    capacity: float
+    segments: list[_Segment]
+    forbidden: frozenset[tuple[int, int]]
+    used: float = 0.0
+    feasible: _Iv | None = None
+    lots: list["_Batch"] = field(default_factory=list)
+    fail: str | None = None
+
+    def _forbidden(self, batch_no: int) -> bool:
+        return any(
+            (a == batch_no and lot.no == b) or (b == batch_no and lot.no == a)
+            for a, b in self.forbidden
+            for lot in self.lots
+        )
+
+    def try_add(self, batch: "_Batch") -> bool:
+        """尝试把 batch 的 1 件加入本箱;通过全部校验返回 True。"""
+        self.fail = None
+        if self._forbidden(batch.no):
+            self.fail = "forbidden"
+            return False
+        if self.used + batch.unit_volume > self.capacity + EPS:
+            self.fail = "capacity"
+            return False
+        new_feasible = (
+            batch.iv if self.feasible is None else self.feasible.intersect(batch.iv)
+        )
+        if new_feasible is None:
+            self.fail = "temp"
+            return False
+        if _first_failed_segment(self.segments, new_feasible) is not None:
+            self.fail = "temp"
+            return False
+        if _first_failed_lock_run(self.segments, new_feasible) is not None:
+            self.fail = "lock"
+            return False
+        already_in = any(lot.no == batch.no for lot in self.lots)
+        if not already_in:
+            new_lots = self.lots + [batch]
+            if any(lot.budget is not None for lot in new_lots) and not _simulate_heat(
+                self.segments, new_feasible, new_lots
+            )["ok"]:
+                self.fail = "budget"
+                return False
+        self.used = _r(self.used + batch.unit_volume)
+        self.feasible = new_feasible
+        if not already_in:
+            self.lots.append(batch)
+        return True
+
+    def snapshot(self) -> tuple[float, _Iv | None, list["_Batch"]]:
+        return self.used, self.feasible, list(self.lots)
+
+    def restore(self, snap: tuple[float, _Iv | None, list["_Batch"]]) -> None:
+        self.used, self.feasible, self.lots = snap
+
+
+def _solo_infeasible_reason(
+    b: _Batch,
+    transport_hours: float,
+    segments: list[_Segment],
+    segment_mode: bool,
+) -> tuple[str, dict[str, Any]] | None:
+    """单批固有不可装载预检(与拼箱无关);返回 (原因, 附加字段) 或 None。"""
+    if b.max_hours is not None and transport_hours > b.max_hours + EPS:
+        return (
+            f"运输时长 {_r(transport_hours)}h 超过该批允许的 "
+            f"{_r(b.max_hours)}h,全程温度无法保证",
+            {},
+        )
+    failed_seg = _first_failed_segment(segments, b.iv)
+    if failed_seg is not None:
+        if segment_mode:
+            return (
+                f"运输段「{failed_seg.name}」(第 {failed_seg.no} 段,"
+                f"{_r(failed_seg.hours)}h)的可用温区 "
+                f"({_fmt_names([z.name for z in failed_seg.zones])}) 与允许温区 "
+                f"[{_r(b.iv.lo)}, {_r(b.iv.hi)}]℃ 均无交集,全程温度无法保证",
+                {
+                    "failed_segment_no": failed_seg.no,
+                    "failed_segment_name": failed_seg.name,
+                },
+            )
+        return (
+            f"允许温区 [{_r(b.iv.lo)}, {_r(b.iv.hi)}]℃ 与全部可用温区 "
+            f"({_fmt_names([z.name for z in segments[0].zones])}) 均无交集",
+            {},
+        )
+    failed_lock = _first_failed_lock_run(segments, b.iv)
+    if failed_lock is not None:
+        group_name, run_segs = failed_lock
+        seg_desc = "、".join(f"第 {s.no} 段「{s.name}」" for s in run_segs)
+        return (
+            f"锁温组「{group_name}」({seg_desc})要求共用一个设定点,"
+            f"但允许温区 [{_r(b.iv.lo)}, {_r(b.iv.hi)}]℃ 在各段可行温度段的"
+            f"交集为空,不存在共享设定点,任何装箱组合均不可用",
+            {
+                "failed_lock_group": group_name,
+                "failed_lock_segments": [
+                    {"segment_no": s.no, "name": s.name} for s in run_segs
+                ],
+            },
+        )
+    if b.budget is not None:
+        sim = _simulate_heat(segments, b.iv, [b])
+        if not sim["ok"]:
+            first_no = sim["first_exceeded"].get(b.no)
+            first_seg = segments[first_no - 1] if first_no else None
+            note = (
+                f"(首次超限:第 {first_seg.no} 段「{first_seg.name}」)"
+                if first_seg
+                else ""
+            )
+            return (
+                f"按逐段最优设定点,该批全程累计热暴露 "
+                f"{_r(sim['exposures'][b.no])} ℃·h 超过度时预算 "
+                f"{_r(b.budget)} ℃·h{note},任何装箱组合均不可用",
+                {
+                    "cumulative_exposure": _r(sim["exposures"][b.no]),
+                    "max_degree_hours": _r(b.budget),
+                    "first_exceeded_segment_no": first_seg.no if first_seg else None,
+                    "first_exceeded_segment_name": (
+                        first_seg.name if first_seg else None
+                    ),
+                },
+            )
+    return None
+
+
+def _solve_incompatible(
+    batches: list[_Batch],
+    box_capacity: float,
+    max_boxes: int,
+    segments: list[_Segment],
+    forbidden: frozenset[tuple[int, int]],
+) -> tuple[list[int] | None, str | None]:
+    """禁配装箱模式精确搜索。
+
+    件序列按输入批次逐件展开;对 RGS(受限增长串)形式的分配做深度优先枚举,
+    每个箱都须通过容量、逐段温区、锁温组与度时预算校验且不含禁配双方。
+    返回 (最优件→箱标签序列, 无界最少箱数受 max_boxes 限制时的原因);
+    失败时序列为 None。同批第 j(j>=2) 件只允许进入不早于该批首件的箱号,
+    利用分配的对称性剪枝且不损失字典序最优解。
+    """
+    # 件序列:[(批号, 批次对象), ...],按输入批次逐件展开
+    pieces: list[tuple[int, _Batch]] = [
+        (b.no, b) for b in batches for _ in range(b.units)
+    ]
+    n = len(pieces)
+    labels = [-1] * n
+    parts: list[_Part] = []
+    best: list[int] | None = None
+
+    def dfs(pos: int) -> None:
+        nonlocal best
+        if pos == n:
+            # 目标优先级:最终箱数最少;箱数相同取件→箱号序列字典序最小
+            key = (max(labels) + 1, tuple(labels))
+            if best is None or key < (max(best) + 1, tuple(best)):
+                best = list(labels)
+            return
+        no, batch = pieces[pos]
+        # 1) 已有箱子,按箱号(首次出现)顺序尝试 → 首次可行即字典序最小方向。
+        #    同批后续件不做"不早于首件箱"的剪枝:首件所在箱可能在当时被其他批
+        #    占满/禁配,后续同批件需要进入更晚的新箱,反而能减少总箱数。
+        #    也不对"当前状态相同的箱"去重:相同状态的箱后续可放入的批并不相同。
+        for k in range(len(parts)):
+            part = parts[k]
+            snap = part.snapshot()
+            if part.try_add(batch):
+                labels[pos] = k
+                dfs(pos + 1)
+                labels[pos] = -1
+            part.restore(snap)
+        # 2) 开新箱:不得超过最大箱数;已知最优箱数时,开新箱后箱数若已超过
+        # 最优箱数则不必尝试(RGS 下已用标签 0..len(parts)-1)
+        if len(parts) < max_boxes and (
+            best is None or len(parts) + 1 <= max(best) + 1
+        ):
+            part = _Part(
+                capacity=box_capacity, segments=segments, forbidden=forbidden
+            )
+            if part.try_add(batch):
+                parts.append(part)
+                labels[pos] = len(parts) - 1
+                dfs(pos + 1)
+                labels[pos] = -1
+                parts.pop()
+
+    dfs(0)
+    if best is not None:
+        return best, None
+    # 有限箱数内无解:放开箱数重搜,区分"固有不可装载"与"箱数不足"
+    unbounded: list[_Part] = []
+    ulabels = [-1] * n
+
+    def dfs_unbounded(pos: int) -> bool:
+        if pos == n:
+            return True
+        no, batch = pieces[pos]
+        tried_keys: set = set()
+        for k in range(len(unbounded)):
+            part = unbounded[k]
+            key = (
+                _r(part.used),
+                part.feasible.lo if part.feasible else None,
+                part.feasible.hi if part.feasible else None,
+                tuple(sorted(lot.no for lot in part.lots)),
+            )
+            if key in tried_keys:
+                continue
+            tried_keys.add(key)
+            snap = part.snapshot()
+            if part.try_add(batch):
+                ulabels[pos] = k
+                if dfs_unbounded(pos + 1):
+                    return True
+            part.restore(snap)
+        part = _Part(capacity=box_capacity, segments=segments, forbidden=forbidden)
+        if part.try_add(batch):
+            unbounded.append(part)
+            ulabels[pos] = len(unbounded) - 1
+            if dfs_unbounded(pos + 1):
+                return True
+            unbounded.pop()
+            ulabels[pos] = -1
+        return False
+
+    if not dfs_unbounded(0):
+        return None, "infeasible"
+    return None, (
+        f"全员装载至少需要 {len(unbounded)} 个箱子,超过最大箱数 {max_boxes},"
+        f"在禁配装箱模式下无可行方案"
+    )
+
+
+def _replay_labels_to_boxes(
+    batches: list[_Batch],
+    labels: list[int],
+    box_capacity: float,
+    segments: list[_Segment],
+    forbidden: frozenset[tuple[int, int]],
+) -> list[_Box]:
+    """按件→箱标签序列(箱号=首次出现顺序)重放出输出用 _Box 列表。"""
+    box_count = max(labels) + 1
+    boxes = [
+        _Box(index=k + 1, capacity=box_capacity, segments=segments, forbidden=forbidden)
+        for k in range(box_count)
+    ]
+    k_idx = 0
+    for b in batches:
+        for _ in range(b.units):
+            assert boxes[labels[k_idx]].try_load(b, b.iv)
+            k_idx += 1
+    return boxes
+
+
+def _build_plan_output(
+    *,
+    boxes: list[_Box],
+    unloaded: list[dict[str, Any]],
+    infeasible_reason: str | None,
+    batches: list[_Batch],
+    segments: list[_Segment],
+    transport_hours: float,
+    segment_mode: bool,
+    max_boxes: int,
+    volume_unit: str,
+    incompatible_mode: bool,
+    forbidden_pairs: frozenset[tuple[int, int]],
+    infeasible_batch_no: int | None = None,
+) -> dict[str, Any]:
+    """把装箱结果组装为规划响应;禁配模式无解时 infeasible_reason 非空且无部分方案。"""
+    # 段下标 -> (锁温组名, 组内段号列表),用于按段标注共享设定点
+    lock_members: dict[int, tuple[str, list[int]]] = {}
+    for group, idxs in _lock_units(segments):
+        if group is None:
+            continue
+        nos = [segments[i].no for i in idxs]
+        for i in idxs:
+            lock_members[i] = (group, nos)
+
+    out_boxes: list[dict[str, Any]] = []
+    loaded_units = 0
+    loaded_volume = 0.0
+    for box in boxes:
+        assert box.feasible is not None
+        # 逐段设定点:箱内有预算批次时按"最大累计预算使用率最低"贪心选取,
+        # 否则保持原规则(最宽可行区间中点)
+        heat_sim = _simulate_heat(box.segments, box.feasible, box.lots)
+        setpoints = heat_sim["setpoints"]
+        # 逐段校验:每段可设定温度 = 箱内货物共同交集 ∩ 该段各温区,再合并相邻段
+        segment_checks: list[dict[str, Any]] = []
+        envelope_raw: list[_Iv] = []
+        transportable = True
+        for idx, seg in enumerate(box.segments):
+            merged = _merge_segments(
+                [
+                    s
+                    for z in seg.zones
+                    if (s := box.feasible.intersect(z.iv)) is not None
+                ]
+            )
+            matched = [
+                z.name
+                for z in seg.zones
+                if box.feasible.intersect(z.iv) is not None
+            ]
+            ok = bool(merged)
+            lock_info = lock_members.get(idx)
+            check: dict[str, Any] = {
+                "segment_no": seg.no,
+                "name": seg.name,
+                "hours": _r(seg.hours),
+                "ok": ok,
+                "temperature_segments": [
+                    {"t_min": _r(s.lo), "t_max": _r(s.hi)} for s in merged
+                ],
+                "matched_zones": matched,
+                "recommended_setpoint": (
+                    _r(setpoints[idx]) if setpoints[idx] is not None else None
+                ),
+                # 锁温组:组名、共用设定点的段号、共享设定点(未分组段为 None)
+                "lock_group": lock_info[0] if lock_info else None,
+                "lock_group_segments": lock_info[1] if lock_info else None,
+                "shared_setpoint": (
+                    _r(setpoints[idx])
+                    if lock_info and setpoints[idx] is not None
+                    else None
+                ),
+            }
+            if ok:
+                envelope_raw.extend(merged)
+            else:
+                transportable = False
+                check["reason"] = (
+                    f"箱内货物共同允许温度 [{_r(box.feasible.lo)}, "
+                    f"{_r(box.feasible.hi)}]℃ 与该段可用温区均无交集"
+                )
+            segment_checks.append(check)
+
+        # 全程温度包络(兼容字段)= 各段可设定温度段合并后的结果
+        envelope = _merge_segments(envelope_raw)
+        widest = max(envelope, key=lambda s: s.hi - s.lo)
+        matched_all = list(
+            dict.fromkeys(name for c in segment_checks for name in c["matched_zones"])
+        )
+        items_out = []
+        for it in box.items:
+            loaded_units += it.units
+            loaded_volume += it.volume
+            items_out.append(
+                {
+                    "batch_no": it.batch_no,
+                    "name": it.name,
+                    "units": it.units,
+                    "volume": _r(it.volume),
+                }
+            )
+        # 各批热暴露核算:仅填写了首选区间/度时预算的批次有对应数值
+        lots_by_no = {lot.no: lot for lot in box.lots}
+        seg_names = {s.no: s.name for s in box.segments}
+        heat_exposure: list[dict[str, Any]] = []
+        for it in box.items:
+            lot = lots_by_no[it.batch_no]
+            exposure = heat_sim["exposures"].get(lot.no)
+            first_no = heat_sim["first_exceeded"].get(lot.no)
+            heat_exposure.append(
+                {
+                    "batch_no": lot.no,
+                    "name": lot.name,
+                    "preferred_t_min": _r(lot.pref.lo) if lot.pref else None,
+                    "preferred_t_max": _r(lot.pref.hi) if lot.pref else None,
+                    "max_degree_hours": (
+                        _r(lot.budget) if lot.budget is not None else None
+                    ),
+                    "cumulative_exposure": (
+                        _r(exposure) if exposure is not None else None
+                    ),
+                    "remaining_budget": (
+                        _r(lot.budget - exposure)
+                        if lot.budget is not None and exposure is not None
+                        else None
+                    ),
+                    "usage_ratio": (
+                        _r(_usage_ratio(exposure, lot.budget))
+                        if lot.budget is not None and exposure is not None
+                        else None
+                    ),
+                    "exceeded": (
+                        lot.no in heat_sim["first_exceeded"]
+                        if lot.budget is not None
+                        else None
+                    ),
+                    "first_exceeded_segment_no": first_no,
+                    "first_exceeded_segment_name": (
+                        seg_names.get(first_no) if first_no else None
+                    ),
+                }
+            )
+        out_boxes.append(
+            {
+                "box_no": box.index,
+                "temperature_range": {
+                    "t_min": _r(envelope[0].lo),
+                    "t_max": _r(envelope[-1].hi),
+                },
+                "temperature_segments": [
+                    {"t_min": _r(s.lo), "t_max": _r(s.hi)} for s in envelope
+                ],
+                "recommended_setpoint": _r((widest.lo + widest.hi) / 2),
+                "matched_zones": matched_all,
+                "transportable": transportable,
+                "segment_checks": segment_checks,
+                "heat_exposure": heat_exposure,
+                "heat_exposure_ok": heat_sim["ok"],
+                "used_volume": _r(box.used),
+                "capacity": _r(box.capacity),
+                "utilization": _r(min(1.0, box.used / box.capacity)),
+                "items": items_out,
+            }
+        )
+
+    total_units = sum(c.units for c in batches)
+    total_volume = sum(c.total_volume for c in batches)
+    unloaded_units = sum(u["units"] for u in unloaded)
+    feasible = infeasible_reason is None
+    all_transportable = feasible and unloaded_units == 0 and all(
+        b["transportable"] for b in out_boxes
+    )
+
+    result: dict[str, Any] = {
+        "summary": {
+            "total_cargo_units": total_units,
+            "loaded_units": loaded_units,
+            "unloaded_units": unloaded_units,
+            "total_cargo_volume": _r(total_volume),
+            "loaded_volume": _r(loaded_volume),
+            "unloaded_volume": _r(total_volume - loaded_volume),
+            "boxes_used": len(boxes),
+            "max_boxes": max_boxes,
+            "all_loaded": feasible and unloaded_units == 0,
+            "transport_hours": _r(transport_hours),
+            "segment_mode": segment_mode,
+            "all_transportable": all_transportable,
+            "incompatible_mode": incompatible_mode,
+            "feasible": feasible,
+        },
+        "segments": [
+            {
+                "segment_no": seg.no,
+                "name": seg.name,
+                "hours": _r(seg.hours),
+                "lock_group": seg.lock_group,
+                "zones": [
+                    {"name": z.name, "t_min": _r(z.iv.lo), "t_max": _r(z.iv.hi)}
+                    for z in seg.zones
+                ],
+            }
+            for seg in segments
+        ],
+        "boxes": out_boxes,
+        "unloaded": unloaded,
+        "volume_unit": volume_unit,
+        "incompatible_mode": incompatible_mode,
+        "forbidden_pairs": [
+            {"batch_no": a, "other_batch_no": b} for a, b in sorted(forbidden_pairs)
+        ],
+        "feasible": feasible,
+        "infeasible_reason": infeasible_reason,
+    }
+    if infeasible_batch_no is not None:
+        result["infeasible_batch_no"] = infeasible_batch_no
+    return result
+
+
 def plan(payload: dict[str, Any]) -> dict[str, Any]:
     """根据请求 payload 生成分箱方案;输入不合法时抛 ValueError。"""
     box_capacity = float(payload.get("box_capacity", 0))
@@ -469,6 +1036,98 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
         )
     if not batches:
         raise ValueError("至少需要录入一批货物")
+
+    # 禁配装箱模式:启用后用精确搜索求箱数最少、并列字典序最小的全员装载方案;
+    # 未启用时完全沿用原 First-Fit-Decreasing 启发式规划
+    incompatible_mode = bool(payload.get("incompatible_mode"))
+    forbidden_pairs: frozenset[tuple[int, int]] = frozenset()
+    if incompatible_mode:
+        raw_cargoes = payload.get("cargoes") or []
+        forbidden_pairs = parse_incompatible_declarations(raw_cargoes)
+        total_units = sum(b.units for b in batches)
+        if not INCOMPATIBLE_MIN_UNITS <= total_units <= INCOMPATIBLE_MAX_UNITS:
+            raise ValueError(
+                f"禁配装箱模式启用时总件数须在 {INCOMPATIBLE_MIN_UNITS}~"
+                f"{INCOMPATIBLE_MAX_UNITS} 件之间,当前共 {total_units} 件,已拒绝"
+            )
+        for b in batches:
+            if b.unit_volume > box_capacity + EPS:
+                return _build_plan_output(
+                    boxes=[],
+                    unloaded=[],
+                    infeasible_reason=(
+                        f"货物「{b.name}」单件体积 {_r(b.unit_volume)} {volume_unit}"
+                        f" 超过单箱容量 {_r(box_capacity)} {volume_unit},任何箱子均"
+                        f"无法装载,禁配装箱模式要求全员装载,无可行方案"
+                    ),
+                    batches=batches,
+                    segments=segments,
+                    transport_hours=transport_hours,
+                    segment_mode=segment_mode,
+                    max_boxes=max_boxes,
+                    volume_unit=volume_unit,
+                    incompatible_mode=True,
+                    forbidden_pairs=forbidden_pairs,
+                )
+            solo = _solo_infeasible_reason(b, transport_hours, segments, segment_mode)
+            if solo is not None:
+                reason, extra = solo
+                return _build_plan_output(
+                    boxes=[],
+                    unloaded=[],
+                    infeasible_reason=(
+                        f"货物「{b.name}」(第 {b.no} 批){reason},禁配装箱模式要求"
+                        f"全员装载,无可行方案"
+                    ),
+                    infeasible_batch_no=b.no,
+                    batches=batches,
+                    segments=segments,
+                    transport_hours=transport_hours,
+                    segment_mode=segment_mode,
+                    max_boxes=max_boxes,
+                    volume_unit=volume_unit,
+                    incompatible_mode=True,
+                    forbidden_pairs=forbidden_pairs,
+                )
+
+        labels, limit_reason = _solve_incompatible(
+            batches, box_capacity, max_boxes, segments, forbidden_pairs
+        )
+        if labels is None:
+            if limit_reason == "infeasible":
+                # 放开箱数仍无解(理论上已被单批预检与单件容量预检覆盖,兜底)
+                reason = "禁配装箱模式下不存在满足全部约束的全员装载方案"
+            else:
+                reason = limit_reason
+            return _build_plan_output(
+                boxes=[],
+                unloaded=[],
+                infeasible_reason=reason,
+                batches=batches,
+                segments=segments,
+                transport_hours=transport_hours,
+                segment_mode=segment_mode,
+                max_boxes=max_boxes,
+                volume_unit=volume_unit,
+                incompatible_mode=True,
+                forbidden_pairs=forbidden_pairs,
+            )
+        boxes = _replay_labels_to_boxes(
+            batches, labels, box_capacity, segments, forbidden_pairs
+        )
+        return _build_plan_output(
+            boxes=boxes,
+            unloaded=[],
+            infeasible_reason=None,
+            batches=batches,
+            segments=segments,
+            transport_hours=transport_hours,
+            segment_mode=segment_mode,
+            max_boxes=max_boxes,
+            volume_unit=volume_unit,
+            incompatible_mode=True,
+            forbidden_pairs=forbidden_pairs,
+        )
 
     boxes: list[_Box] = []
     unloaded: list[dict[str, Any]] = []
@@ -671,193 +1330,16 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
             while remaining > 0 and box.try_load(b, b.iv):
                 remaining -= 1
 
-    # 6) 组装输出
-    # 段下标 -> (锁温组名, 组内段号列表),用于按段标注共享设定点
-    lock_members: dict[int, tuple[str, list[int]]] = {}
-    for group, idxs in _lock_units(segments):
-        if group is None:
-            continue
-        nos = [segments[i].no for i in idxs]
-        for i in idxs:
-            lock_members[i] = (group, nos)
-
-    out_boxes: list[dict[str, Any]] = []
-    loaded_units = 0
-    loaded_volume = 0.0
-    for box in boxes:
-        assert box.feasible is not None
-        # 逐段设定点:箱内有预算批次时按"最大累计预算使用率最低"贪心选取,
-        # 否则保持原规则(最宽可行区间中点)
-        heat_sim = _simulate_heat(box.segments, box.feasible, box.lots)
-        setpoints = heat_sim["setpoints"]
-        # 逐段校验:每段可设定温度 = 箱内货物共同交集 ∩ 该段各温区,再合并相邻段
-        segment_checks: list[dict[str, Any]] = []
-        envelope_raw: list[_Iv] = []
-        transportable = True
-        for idx, seg in enumerate(box.segments):
-            merged = _merge_segments(
-                [
-                    s
-                    for z in seg.zones
-                    if (s := box.feasible.intersect(z.iv)) is not None
-                ]
-            )
-            matched = [
-                z.name
-                for z in seg.zones
-                if box.feasible.intersect(z.iv) is not None
-            ]
-            ok = bool(merged)
-            lock_info = lock_members.get(idx)
-            check: dict[str, Any] = {
-                "segment_no": seg.no,
-                "name": seg.name,
-                "hours": _r(seg.hours),
-                "ok": ok,
-                "temperature_segments": [
-                    {"t_min": _r(s.lo), "t_max": _r(s.hi)} for s in merged
-                ],
-                "matched_zones": matched,
-                "recommended_setpoint": (
-                    _r(setpoints[idx]) if setpoints[idx] is not None else None
-                ),
-                # 锁温组:组名、共用设定点的段号、共享设定点(未分组段为 None)
-                "lock_group": lock_info[0] if lock_info else None,
-                "lock_group_segments": lock_info[1] if lock_info else None,
-                "shared_setpoint": (
-                    _r(setpoints[idx])
-                    if lock_info and setpoints[idx] is not None
-                    else None
-                ),
-            }
-            if ok:
-                envelope_raw.extend(merged)
-            else:
-                transportable = False
-                check["reason"] = (
-                    f"箱内货物共同允许温度 [{_r(box.feasible.lo)}, "
-                    f"{_r(box.feasible.hi)}]℃ 与该段可用温区均无交集"
-                )
-            segment_checks.append(check)
-
-        # 全程温度包络(兼容字段)= 各段可设定温度段合并后的结果
-        envelope = _merge_segments(envelope_raw)
-        widest = max(envelope, key=lambda s: s.hi - s.lo)
-        matched_all = list(
-            dict.fromkeys(name for c in segment_checks for name in c["matched_zones"])
-        )
-        items_out = []
-        for it in box.items:
-            loaded_units += it.units
-            loaded_volume += it.volume
-            items_out.append(
-                {
-                    "batch_no": it.batch_no,
-                    "name": it.name,
-                    "units": it.units,
-                    "volume": _r(it.volume),
-                }
-            )
-        # 各批热暴露核算:仅填写了首选区间/度时预算的批次有对应数值
-        lots_by_no = {lot.no: lot for lot in box.lots}
-        seg_names = {s.no: s.name for s in box.segments}
-        heat_exposure: list[dict[str, Any]] = []
-        for it in box.items:
-            lot = lots_by_no[it.batch_no]
-            exposure = heat_sim["exposures"].get(lot.no)
-            first_no = heat_sim["first_exceeded"].get(lot.no)
-            heat_exposure.append(
-                {
-                    "batch_no": lot.no,
-                    "name": lot.name,
-                    "preferred_t_min": _r(lot.pref.lo) if lot.pref else None,
-                    "preferred_t_max": _r(lot.pref.hi) if lot.pref else None,
-                    "max_degree_hours": (
-                        _r(lot.budget) if lot.budget is not None else None
-                    ),
-                    "cumulative_exposure": (
-                        _r(exposure) if exposure is not None else None
-                    ),
-                    "remaining_budget": (
-                        _r(lot.budget - exposure)
-                        if lot.budget is not None and exposure is not None
-                        else None
-                    ),
-                    "usage_ratio": (
-                        _r(_usage_ratio(exposure, lot.budget))
-                        if lot.budget is not None and exposure is not None
-                        else None
-                    ),
-                    "exceeded": (
-                        lot.no in heat_sim["first_exceeded"]
-                        if lot.budget is not None
-                        else None
-                    ),
-                    "first_exceeded_segment_no": first_no,
-                    "first_exceeded_segment_name": (
-                        seg_names.get(first_no) if first_no else None
-                    ),
-                }
-            )
-        out_boxes.append(
-            {
-                "box_no": box.index,
-                "temperature_range": {
-                    "t_min": _r(envelope[0].lo),
-                    "t_max": _r(envelope[-1].hi),
-                },
-                "temperature_segments": [
-                    {"t_min": _r(s.lo), "t_max": _r(s.hi)} for s in envelope
-                ],
-                "recommended_setpoint": _r((widest.lo + widest.hi) / 2),
-                "matched_zones": matched_all,
-                "transportable": transportable,
-                "segment_checks": segment_checks,
-                "heat_exposure": heat_exposure,
-                "heat_exposure_ok": heat_sim["ok"],
-                "used_volume": _r(box.used),
-                "capacity": _r(box.capacity),
-                "utilization": _r(min(1.0, box.used / box.capacity)),
-                "items": items_out,
-            }
-        )
-
-    total_units = sum(c.units for c in batches)
-    total_volume = sum(c.total_volume for c in batches)
-    unloaded_units = sum(u["units"] for u in unloaded)
-    all_transportable = unloaded_units == 0 and all(
-        b["transportable"] for b in out_boxes
+    return _build_plan_output(
+        boxes=boxes,
+        unloaded=unloaded,
+        infeasible_reason=None,
+        batches=batches,
+        segments=segments,
+        transport_hours=transport_hours,
+        segment_mode=segment_mode,
+        max_boxes=max_boxes,
+        volume_unit=volume_unit,
+        incompatible_mode=False,
+        forbidden_pairs=frozenset(),
     )
-
-    return {
-        "summary": {
-            "total_cargo_units": total_units,
-            "loaded_units": loaded_units,
-            "unloaded_units": unloaded_units,
-            "total_cargo_volume": _r(total_volume),
-            "loaded_volume": _r(loaded_volume),
-            "unloaded_volume": _r(total_volume - loaded_volume),
-            "boxes_used": len(boxes),
-            "max_boxes": max_boxes,
-            "all_loaded": unloaded_units == 0,
-            "transport_hours": _r(transport_hours),
-            "segment_mode": segment_mode,
-            "all_transportable": all_transportable,
-        },
-        "segments": [
-            {
-                "segment_no": seg.no,
-                "name": seg.name,
-                "hours": _r(seg.hours),
-                "lock_group": seg.lock_group,
-                "zones": [
-                    {"name": z.name, "t_min": _r(z.iv.lo), "t_max": _r(z.iv.hi)}
-                    for z in seg.zones
-                ],
-            }
-            for seg in segments
-        ],
-        "boxes": out_boxes,
-        "unloaded": unloaded,
-        "volume_unit": volume_unit,
-    }

@@ -129,7 +129,14 @@ def simulate_delay(payload: dict[str, Any]) -> dict[str, Any]:
             f"请重新生成方案后选择有效段号"
         )
     if not baseline["boxes"]:
+        if baseline.get("incompatible_mode") and baseline.get("infeasible_reason"):
+            raise ValueError(
+                f"禁配装箱模式下基准规划无全员装载方案,无法进行延误推演:"
+                f"{baseline['infeasible_reason']}"
+            )
         raise ValueError("当前方案没有任何已装箱货物,无法进行运输延误推演")
+    incompatible_mode = bool(baseline.get("incompatible_mode"))
+    forbidden_pairs = baseline.get("forbidden_pairs", [])
 
     base_segments = _build_segments(seg_rows)
     delayed_segments = copy.deepcopy(base_segments)
@@ -376,7 +383,10 @@ def simulate_delay(payload: dict[str, Any]) -> dict[str, Any]:
             "degree_hours_violation_count": degree_hours_violations,
             "can_continue": can_continue,
             "verdict": verdict,
+            "incompatible_mode": incompatible_mode,
         },
         "can_continue": can_continue,
         "verdict": verdict,
+        "incompatible_mode": incompatible_mode,
+        "forbidden_pairs": forbidden_pairs,
     }

@@ -127,6 +127,13 @@ def create_order(plan_input: dict[str, Any]) -> dict[str, Any]:
     """按规划输入快照创建交接单,冻结各箱各批次应交件数。"""
     result = plan(plan_input)  # 输入非法时抛 ValueError,由入口统一转 400
 
+    # 禁配装箱模式无全员装载方案时不冻结任何部分方案
+    if result.get("incompatible_mode") and not result.get("feasible", True):
+        raise HandoverError(
+            f"禁配装箱模式下无全员装载方案,无法创建交接单:"
+            f"{result.get('infeasible_reason') or '存在无法装载的批次'}"
+        )
+
     # 按 (箱号, 批号) 汇总已装件数,冻结为应交件数
     due: dict[tuple[int, int], dict[str, Any]] = {}
     for box in result["boxes"]:

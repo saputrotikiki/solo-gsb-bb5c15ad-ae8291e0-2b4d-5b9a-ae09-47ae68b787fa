@@ -151,6 +151,7 @@ function addCargoRow(c = {}) {
     zoneCell(c.preferred_t_max ?? "", "首选上限", "number"),
     `<input type="number" step="any" min="0" value="${c.max_degree_hours ?? ""}" placeholder="不限" />`,
     `<input type="number" step="any" min="0" value="${c.max_transport_hours ?? ""}" placeholder="不限" />`,
+    `<input class="incompatible-input" type="text" value="${c.incompatible_with ?? ""}" placeholder="如 2,3" title="禁配装箱模式:不可同箱的其他批号(当前列表序号,逗号分隔)" />`,
     '<button type="button" class="btn btn-del">删除</button>',
   ]);
 }
@@ -228,10 +229,11 @@ function collectSegments() {
 
 function collectInput() {
   const useSeg = $("useSegments").checked;
+  const useIncompat = $("useIncompatible").checked;
   const zones = useSeg ? [] : readZones($("zoneRows"));
   const segments = useSeg ? collectSegments() : [];
 
-  const cargoes = readRows($("cargoRows"), 9, [
+  const cargoes = readRows($("cargoRows"), 10, [
     { key: "name", label: "名称" },
     { key: "units", label: "件数", numeric: true },
     { key: "unit_volume", label: "单件体积", numeric: true },
@@ -241,6 +243,7 @@ function collectInput() {
     { key: "preferred_t_max", label: "首选温度上限", numeric: false },
     { key: "max_degree_hours", label: "度时预算", numeric: false },
     { key: "max_transport_hours", label: "最长运输时长", numeric: false },
+    { key: "incompatible_with", label: "不可同箱批号", numeric: false },
   ]).map((c, i) => ({
     ...c,
     name: c.name || `批次 ${i + 1}`,
@@ -248,10 +251,12 @@ function collectInput() {
     preferred_t_max: c.preferred_t_max === "" ? null : Number(c.preferred_t_max),
     max_degree_hours: c.max_degree_hours === "" ? null : Number(c.max_degree_hours),
     max_transport_hours: c.max_transport_hours === "" ? null : Number(c.max_transport_hours),
+    incompatible_with: (c.incompatible_with || "").trim(),
   }));
 
   if (!useSeg && zones.length === 0) throw new Error("请至少添加一个允许温区");
   if (cargoes.length === 0) throw new Error("请至少添加一批货物");
+  let totalUnits = 0;
   for (const c of cargoes) {
     if (c.units <= 0) throw new Error(`货物「${c.name}」件数必须大于 0`);
     if (c.unit_volume <= 0) throw new Error(`货物「${c.name}」单件体积必须大于 0`);
@@ -267,6 +272,29 @@ function collectInput() {
     }
     if (c.max_transport_hours !== null && c.max_transport_hours < 0)
       throw new Error(`货物「${c.name}」最长运输时长不能为负`);
+    totalUnits += c.units;
+  }
+
+  /* 禁配装箱模式:总件数 1~10;批号声明必须为 1~批次数 的整数、不可引用自身 */
+  if (useIncompat) {
+    if (totalUnits < 1 || totalUnits > 10)
+      throw new Error(`禁配装箱模式启用时总件数须在 1~10 件之间,当前共 ${totalUnits} 件`);
+    cargoes.forEach((c, i) => {
+      const no = i + 1;
+      const tokens = c.incompatible_with
+        .split(/[,，、;；\s]+/)
+        .map((t) => t.trim())
+        .filter(Boolean);
+      for (const tok of tokens) {
+        if (!/^\+?\d+$/.test(tok))
+          throw new Error(`货物「${c.name}」(第 ${no} 行)的不可同箱批号含非法序号「${tok}」:须为 1~${cargoes.length} 的正整数,逗号分隔`);
+        const target = Number(tok);
+        if (target === no)
+          throw new Error(`货物「${c.name}」(第 ${no} 行)的不可同箱批号不能引用自身(序号 ${no})`);
+        if (target < 1 || target > cargoes.length)
+          throw new Error(`货物「${c.name}」(第 ${no} 行)声明的不可同箱批号 ${target} 超出范围:当前共 ${cargoes.length} 批,序号须在 1~${cargoes.length} 之间`);
+      }
+    });
   }
 
   return {
@@ -277,7 +305,12 @@ function collectInput() {
     volume_unit: $("volumeUnit").value.trim() || "体积单位",
     zones,
     segments,
-    cargoes,
+    cargoes: cargoes.map((c) => {
+      /* 未启用禁配模式时不下发批号声明,保留原规划输入 */
+      const { incompatible_with, ...rest } = c;
+      return useIncompat ? { ...rest, incompatible_with } : rest;
+    }),
+    incompatible_mode: useIncompat,
   };
 }
 
@@ -294,10 +327,13 @@ function renderSummary(s, unit) {
   const statusText = s.all_loaded
     ? s.segment_mode ? "✓ 全程可运输" : "✓ 全部装载"
     : "⚠ 存在冲突";
+  const modeBadge = s.incompatible_mode
+    ? `<span class="badge badge-incompat">🚫 禁配装箱${s.feasible ? " · 箱数已最少" : " · 无解"}</span>`
+    : "";
   $("summary").innerHTML = `
     <div class="stat ${cls}"><div class="k">装载状态</div>
       <div class="v"><span class="badge ${s.all_loaded ? "badge-ok" : "badge-bad"}">
-        ${statusText}</span></div></div>
+        ${statusText}</span>${modeBadge}</div></div>
     <div class="stat"><div class="k">已装 / 总件数</div><div class="v">${fmt(s.loaded_units)} / ${fmt(s.total_cargo_units)}</div></div>
     <div class="stat"><div class="k">已装 / 总体积</div><div class="v">${fmt(s.loaded_volume)} / ${fmt(s.total_cargo_volume)} ${unit}</div></div>
     <div class="stat"><div class="k">使用箱数</div><div class="v">${s.boxes_used} <small class="muted">/ ${s.max_boxes}</small></div></div>
@@ -377,8 +413,22 @@ function renderHeatExposure(box) {
     </table>`;
 }
 
-function renderBox(box, unit, segmentMode) {
+function renderBox(box, unit, segmentMode, data) {
   const segText = fmtSegs(box.temperature_segments);
+  /* 禁配模式:列出本箱涉及的禁配批号对(双方均在箱内不应出现;仅作快照展示) */
+  let forbiddenNote = "";
+  if (data && data.incompatible_mode) {
+    const inBox = new Set(box.items.map((it) => it.batch_no));
+    const related = (data.forbidden_pairs || []).filter(
+      (p) => inBox.has(p.batch_no) || inBox.has(p.other_batch_no)
+    );
+    if (related.length) {
+      const text = related
+        .map((p) => `#${p.batch_no} ⛔ #${p.other_batch_no}${inBox.has(p.batch_no) && inBox.has(p.other_batch_no) ? " ⚠同箱" : ""}`)
+        .join("　");
+      forbiddenNote = `<div class="meta-line incompatible-note">禁配约束:${text}</div>`;
+    }
+  }
   const items = box.items
     .map(
       (it) => `<tr>
@@ -413,6 +463,7 @@ function renderBox(box, unit, segmentMode) {
     <div class="cap-bar"><i style="width:${pct}%"></i></div>
     ${segmentMode ? renderSegmentChecks(box) : ""}
     ${renderHeatExposure(box)}
+    ${forbiddenNote}
     <table class="items">
       <thead><tr><th>装载批次</th><th class="num">件数</th><th class="num">占用体积</th></tr></thead>
       <tbody>${items}</tbody>
@@ -501,13 +552,45 @@ async function runPlan() {
 function renderResult(data) {
   $("resultPlaceholder").hidden = true;
   $("resultView").hidden = false;
+  renderIncompatibleBanner(data);
+  renderNoSolution(data);
   renderSummary(data.summary, data.volume_unit);
   $("boxCount").textContent = `（共 ${data.boxes.length} 箱）`;
   $("boxes").innerHTML = "";
-  data.boxes.forEach((b) => renderBox(b, data.volume_unit, data.summary.segment_mode));
+  data.boxes.forEach((b) => renderBox(b, data.volume_unit, data.summary.segment_mode, data));
   renderUnloaded(data.unloaded, data.volume_unit);
   setupReview(data);
   setupDelay(data);
+}
+
+/* 禁配装箱模式提示条:模式状态、禁配对快照 */
+function renderIncompatibleBanner(data) {
+  const el = $("incompatibleBanner");
+  if (!data.incompatible_mode) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  const pairs = data.forbidden_pairs || [];
+  const pairText = pairs.length
+    ? pairs.map((p) => `#${p.batch_no} ⛔ #${p.other_batch_no}`).join("　")
+    : "未声明禁配批号(仅启用逐件精确求解)";
+  el.hidden = false;
+  el.innerHTML = `🚫 <strong>禁配装箱模式</strong> · 按件精确求解 ·
+    总件数 ${fmt(data.summary.total_cargo_units)} (限 1~10) · 禁配快照:${pairText}`;
+}
+
+/* 禁配模式无解:明确提示且不展示任何部分方案 */
+function renderNoSolution(data) {
+  const el = $("noSolution");
+  if (data.feasible !== false) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = `⛔ <strong>无可执行装箱方案</strong>
+    <div class="no-solution-reason">${escapeHtml(data.infeasible_reason || "在当前禁配约束、容量与温区条件下不存在全员装载方案")}</div>`;
 }
 
 function showError(msg) {
@@ -586,6 +669,7 @@ function renderAssessment(data) {
     <span class="assess-chip">场景数: ${sm.scenario_count}</span>
     <span class="assess-chip ${sm.failed_count ? "chip-bad" : "chip-ok"}">不可运输: ${sm.failed_count}</span>
     <span class="assess-chip ${sm.max_extra_boxes > 0 ? "chip-warn" : ""}">最大额外箱数: +${fmt(sm.max_extra_boxes)}</span>
+    ${data.incompatible_mode ? '<span class="assess-chip" title="评估沿用禁配模式与禁配对快照">🚫 禁配装箱模式</span>' : ""}
     <span class="assess-chip muted">快照 ${data.input_fingerprint.slice(0, 8)}</span>`;
 
   /* 风险矩阵:行 = 运输段,列 = 该段各可用温区(按段序、温区序排列) */
@@ -1004,25 +1088,47 @@ document.querySelector(".input-panel").addEventListener("click", (e) => {
   if (e.target.closest(".btn")) setTimeout(markResultsStale, 0);
 });
 
-$("btnSample").addEventListener("click", () => {
-  $("transportHours").value = SAMPLE.transport_hours;
-  $("boxCapacity").value = SAMPLE.box_capacity;
-  $("maxBoxes").value = SAMPLE.max_boxes;
-  $("volumeUnit").value = SAMPLE.volume_unit;
-  $("useSegments").checked = !!SAMPLE.use_segments;
+/* ---------------- 禁配装箱模式示例(总件数 ≤ 10,逐件精确求解) ---------------- */
+const SAMPLE_INCOMPATIBLE = {
+  use_segments: false,
+  transport_hours: 8,
+  box_capacity: 4,
+  max_boxes: 10,
+  volume_unit: "m³",
+  incompatible_mode: true,
+  zones: [{ name: "全区", t_min: -30, t_max: 30 }],
+  // 共 10 件;批1⛔批2、批2⛔批3(双向禁配);同批可拆箱
+  cargoes: [
+    { name: "试剂A", units: 3, unit_volume: 1, t_min: 2, t_max: 8, incompatible_with: "2" },
+    { name: "试剂B", units: 3, unit_volume: 1, t_min: 2, t_max: 8, incompatible_with: "3" },
+    { name: "试剂C", units: 4, unit_volume: 1, t_min: 2, t_max: 8, incompatible_with: "" },
+  ],
+};
+
+/* 把一组输入铺到页面(供两个示例按钮复用) */
+function fillForm(sample) {
+  $("transportHours").value = sample.transport_hours;
+  $("boxCapacity").value = sample.box_capacity;
+  $("maxBoxes").value = sample.max_boxes;
+  $("volumeUnit").value = sample.volume_unit;
+  $("useSegments").checked = !!sample.use_segments;
+  $("useIncompatible").checked = !!sample.incompatible_mode;
   toggleSegmentMode();
   $("zoneRows").innerHTML = "";
   $("cargoRows").innerHTML = "";
   $("segmentList").innerHTML = "";
-  SAMPLE.zones.forEach((z) => addZoneRow(z));
-  SAMPLE.segments.forEach((s) => addSegmentCard(s));
-  SAMPLE.cargoes.forEach(addCargoRow);
+  (sample.zones || []).forEach((z) => addZoneRow(z));
+  (sample.segments || []).forEach((s) => addSegmentCard(s));
+  (sample.cargoes || []).forEach(addCargoRow);
   showError("");
   $("errorBox").hidden = true;
   $("resultView").hidden = true;
   $("resultPlaceholder").hidden = false;
   markResultsStale();
-});
+}
+
+$("btnSample").addEventListener("click", () => fillForm(SAMPLE));
+$("btnSampleIncompatible").addEventListener("click", () => fillForm(SAMPLE_INCOMPATIBLE));
 
 /* ---------------- 到货交接台账 ---------------- */
 /* 交接单冻结在服务端 SQLite,与当前规划输入无关;页面加载即拉取已有交接单,
@@ -1286,10 +1392,13 @@ async function createHandoverOrder() {
 
 function refreshCreateOrderBtn() {
   const btn = $("btnCreateOrder");
-  btn.disabled = !planSnapshot;
-  btn.title = planSnapshot
-    ? "按当前方案冻结各箱各批次的应交件数,生成新的交接单"
-    : "请先生成分箱方案,再从当前方案创建交接单";
+  const feasible = planSnapshot && planData && planData.feasible !== false;
+  btn.disabled = !feasible;
+  btn.title = !planSnapshot
+    ? "请先生成分箱方案,再从当前方案创建交接单"
+    : planData && planData.feasible === false
+    ? "禁配装箱模式下无全员装载方案,无法创建交接单"
+    : "按当前方案冻结各箱各批次的应交件数,生成新的交接单";
 }
 
 $("btnCreateOrder").addEventListener("click", createHandoverOrder);
@@ -1385,6 +1494,7 @@ function renderDelay(data) {
     <span class="assess-chip">第 ${d.segment_no} 段「${escapeHtml(d.segment_name)}」新增 ${fmt(d.extra_hours)} h</span>
     <span class="assess-chip">总时长 ${fmt(th.original)} → <strong>${fmt(th.delayed)}</strong> h（+${fmt(th.delta)}）</span>
     <span class="assess-chip">推演箱数 ${sm.box_count}</span>
+    ${data.incompatible_mode ? '<span class="assess-chip" title="沿用生成方案时的禁配模式与禁配快照">🚫 禁配装箱模式</span>' : ""}
     <span class="assess-chip muted">快照 ${data.input_fingerprint.slice(0, 8)}</span>`;
   let headNote;
   if (data.can_continue) {

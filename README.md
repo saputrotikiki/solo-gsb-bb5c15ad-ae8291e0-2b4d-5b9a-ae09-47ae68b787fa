@@ -46,6 +46,14 @@ Docker 命名卷上）。支持 **一次提交多行签收/退回记录**（每�
 **超出最长运输时长或度时预算的批次**（度时超限时标出 **首次超限段**）；
 没有受影响批次时明确显示 **可继续运输**。推演绑定生成方案时的输入快照，
 修改输入后旧推演自动标记为 **已过期**，需重新生成方案。
+支持 **禁配装箱模式**：勾选后 **总件数限 1～10**，每个货物行可填写
+**不可同箱的其他批号**（当前货物列表序号，逗号分隔；**单向填写视为双方禁配**；
+非法批号或自身引用直接拒绝）。启用后规划器改为 **逐件精确求解**（同批允许
+逐件拆箱），任何箱子都 **不得同时装入禁配双方**，并仍须通过现有容量、逐段
+温区、锁温组及度时预算全部校验；**在最大箱数内存在全员装载方案时，必返回
+箱数最少者，箱号按首次出现编号，并列时取"按输入批次逐件顺序组成的箱号序列"
+字典序最小者**；**无解时给出明确原因且不返回任何部分方案**。未启用时完全
+保留原 FFD 规划。容灾评估、延误推演与交接单均沿用禁配模式及禁配快照。
 支持在页面上随时修改输入并重新规划。
 
 - 后端：FastAPI（规划算法见 `app/planner.py`；交接台账见 `app/handover.py`，
@@ -87,7 +95,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- |
 | 规划器页面（含到货交接台账） | <http://localhost:8000/> |
 | 健康检查 | <http://localhost:8000/api/health> |
-| 规划接口 | `POST http://localhost:8000/api/plan` |
+| 规划接口 | `POST http://localhost:8000/api/plan`（支持 `incompatible_mode` 禁配装箱模式） |
 | 容灾评估接口 | `POST http://localhost:8000/api/zone-failure-assessment` |
 | 实测温度复核接口 | `POST http://localhost:8000/api/temperature-review` |
 | 运输延误推演接口 | `POST http://localhost:8000/api/transport-delay` |
@@ -126,7 +134,8 @@ APP_PORT=9000 docker compose up -d --build
      相邻且锁温组相同的段将 **共用一个设定点**（留空表示不参与锁温）。
 3. 在 **货物批次** 中录入每批货物：件数、单件体积、允许温度区间（硬边界），
    以及可选的「首选温度区间 + 度时预算」（℃·h，留空表示不限）和
-   「最长运输时长」（留空表示不限）。
+   「最长运输时长」（留空表示不限）；启用禁配装箱模式时，每行还可在
+   **「不可同箱批号」** 列填写其他批号（当前列表序号，逗号分隔）。
 4. 点击 **「▶ 生成分箱方案」**：
    - 每箱展示 **可设定温度区间**（可能含多个不相连温度段）、**推荐设定温度**、
      匹配温区、容量利用率与装载明细（批次、件数、占用体积）；
@@ -194,6 +203,16 @@ APP_PORT=9000 docker compose up -d --build
      违规行与原因；
    - 每条有效记录可点击 **「撤销」**；若撤销会导致后续记录越界，则拒绝
      撤销并指出冲突记录（需先撤销其后的冲突记录）。
+10. 勾选顶部 **「🚫 启用禁配装箱模式」**（或点击 **「载入禁配示例」**）后：
+    - 总件数须为 **1～10**，规划改为逐件精确求解；货物行 **「不可同箱批号」**
+      列填写其他批号（当前列表序号，逗号分隔，如 `2,3`），**单向填写视为
+      双方禁配**，非法批号或自身引用会在前后端同时被拒绝；
+    - 同批允许逐件拆箱；任何箱不得同时装入禁配双方，并通过容量、逐段温区、
+      锁温组与度时预算全部校验；
+    - 有全员装载方案时返回 **箱数最少** 方案，箱号按首次出现编号，并列取
+      **箱号序列字典序最小** 者；**无解时页面红色横幅明确提示原因，不返回
+      部分方案**（容灾评估、延误推演、创建交接单在无解基准下均不可用）；
+    - 取消勾选即恢复原 FFD 启发式规划，原接口调用完全兼容。
 
 ## 五、规划规则
 
@@ -233,6 +252,84 @@ APP_PORT=9000 docker compose up -d --build
     并报告 **首个失败的锁温组及涉及段**；
 - 运输时长超过货物「最长运输时长」时，该批整批不予装载并给出原因；
 - 达到最大箱数或单件体积超过单箱容量时，剩余货物按冲突输出。
+
+## 五·补、禁配装箱模式规则
+
+- **启用方式**：请求体顶层 `"incompatible_mode": true`（页面勾选
+  「🚫 启用禁配装箱模式」）；货物行可选填 `incompatible_with`，内容为
+  **不可同箱的其他批号**——即该货物在当前列表中的 **序号（1 起）**，
+  多个序号用逗号分隔（兼容中文逗号、顿号、分号与空白，亦接受字符串数组）；
+- **输入校验**（任一不满足返回 400/422，前后端均校验）：
+  - 启用时全部货物 **总件数必须在 1～10 之间**（逐件精确求解的规模上界）；
+  - 每个序号必须是 **1～批次数** 的正整数；**引用自身**、**越界批号**、
+    **非数字记号** 一律拒绝，并指出所在货物行与非法记号；
+  - **单向填写视为双方禁配**：仅批 A 填写批 B 时，A、B 同样不得同箱；
+    响应中 `forbidden_pairs` 返回规范化后的无向禁配对快照；
+- **装箱规则**：
+  - 同一批货物允许 **以件为最小单位拆分** 到多个箱子；
+  - **任何箱子都不得同时装入禁配双方**（同批自身不构成禁配，可逐件同箱）；
+  - 每个箱子仍须通过原有全部校验：**容量**、**逐段温区**（每段共同允许温度
+    可被该段某温区覆盖）、**锁温组共享设定点**、**累计度时预算**
+    （含逐段/锁温单元贪心选点）与最长运输时长；
+  - 不再使用 FFD 启发式，而是对件级装箱做 **精确搜索**：
+    **在 `max_boxes` 内只要存在全员装载方案，就必返回箱数最少者**；
+    箱号按 **箱在件序列中首次出现** 的顺序编号（1 起）；箱数相同时取
+    **「按输入批次逐件顺序组成的箱号序列」字典序最小** 的并列方案；
+- **无解处理**：单件超容量、单批固有不兼容（温区/锁温/预算/时长）或
+  全员装载最少箱数超过最大箱数时，响应 `feasible=false`、
+  `infeasible_reason` 给出中文原因，**`boxes` 与 `unloaded` 均为空**
+  （不返回任何部分方案）；页面展示红色「⛔ 无可执行装箱方案」横幅；
+- **下游沿用**：容灾评估（`/api/zone-failure-assessment`）、运输延误推演
+  （`/api/transport-delay`）、实测温度复核与交接单创建均携带同一份
+  禁配模式与禁配对快照重新规划；基准本身无解时容灾评估返回 400、
+  延误推演与交接单创建同样拒绝并提示原因；
+- **未启用时**（默认）`incompatible_mode=false`，即便个别行填写了
+  `incompatible_with` 也一律忽略，规划逻辑、字段与历史版本完全一致。
+
+### 禁配装箱模式接口示例
+
+```bash
+curl -X POST http://localhost:8000/api/plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transport_hours": 8,
+    "box_capacity": 4,
+    "max_boxes": 10,
+    "incompatible_mode": true,
+    "zones": [{"name": "全区", "t_min": -30, "t_max": 30}],
+    "cargoes": [
+      {"name": "试剂A", "units": 3, "unit_volume": 1, "t_min": 2, "t_max": 8,
+       "incompatible_with": "2"},
+      {"name": "试剂B", "units": 3, "unit_volume": 1, "t_min": 2, "t_max": 8,
+       "incompatible_with": "3"},
+      {"name": "试剂C", "units": 4, "unit_volume": 1, "t_min": 2, "t_max": 8}
+    ]
+  }'
+```
+
+10 件、单箱容量 4，禁配对为 1⛔2、2⛔3；最少 3 箱，箱号按首次出现编号，
+响应（节选）：
+
+```json
+{
+  "feasible": true,
+  "infeasible_reason": null,
+  "incompatible_mode": true,
+  "forbidden_pairs": [
+    {"batch_no": 1, "other_batch_no": 2},
+    {"batch_no": 2, "other_batch_no": 3}
+  ],
+  "summary": {"total_cargo_units": 10, "boxes_used": 3, "all_loaded": true,
+              "incompatible_mode": true, "feasible": true},
+  "boxes": [
+    {"box_no": 1, "items": [{"batch_no": 1, "name": "试剂A", "units": 3},
+                            {"batch_no": 3, "name": "试剂C", "units": 1}]},
+    {"box_no": 2, "items": [{"batch_no": 2, "name": "试剂B", "units": 3}]},
+    {"box_no": 3, "items": [{"batch_no": 3, "name": "试剂C", "units": 3}]}
+  ],
+  "unloaded": []
+}
+```
 
 ## 六、单温区故障容灾评估规则
 
@@ -843,6 +940,12 @@ curl -X POST http://localhost:8000/api/temperature-review \
 
 | 字段 | 说明 |
 | --- | --- |
+| `feasible` | 是否存在可执行的全员装载方案；禁配装箱模式无解时为 `false`（原规划恒为 `true`） |
+| `infeasible_reason` | 禁配装箱模式无解时的中文原因；有解时为 `null` |
+| `incompatible_mode` | 是否启用禁配装箱模式（顶层与 `summary` 内均有） |
+| `forbidden_pairs[]` | 规范化后的无向禁配对快照：`batch_no` / `other_batch_no`（序号，`batch_no < other_batch_no`）；未启用时为 `[]` |
+| `summary.feasible` / `summary.incompatible_mode` | 同名字段的摘要镜像，便于前端与下游模块直接判定 |
+| `infeasible_batch_no` | 因单批固有不兼容（温区/锁温/预算/时长/单件超容量）导致无解时，首个问题批号 |
 | `summary.segment_mode` | 是否分段运输模式 |
 | `summary.transport_hours` | 总运输时长（分段模式为各段时长之和） |
 | `summary.all_transportable` | 全部装载且每箱全程逐段通过才为 `true` |
@@ -877,7 +980,7 @@ curl -X POST http://localhost:8000/api/temperature-review \
 .
 ├── app/
 │   ├── main.py        # FastAPI 入口、异常映射与静态资源挂载
-│   ├── planner.py     # 温区兼容 + 容量约束 + 热暴露预算 + 锁温区段分箱算法
+│   ├── planner.py     # 温区/容量/热暴露/锁温分箱 + 禁配装箱模式(逐件精确求解)
 │   ├── resilience.py  # 单温区故障容灾评估(逐温区模拟失效并重规划)
 │   ├── review.py      # 实测温度复核(CSV 校验、仪器误差带、确定/可能超界切段、度时上下界积分)
 │   ├── delay.py       # 运输延误推演(段时长增加后重算逐段设定点与各批累计度时,逐箱对比)
@@ -889,8 +992,9 @@ curl -X POST http://localhost:8000/api/temperature-review \
 │   ├── styles.css
 │   └── app.js
 ├── tests/
-│   ├── test_handover.py  # 台账 API 测试(python tests/test_handover.py)
-│   └── test_delay.py     # 延误推演测试(python tests/test_delay.py)
+│   ├── test_handover.py     # 台账 API 测试(python tests/test_handover.py)
+│   ├── test_delay.py        # 延误推演测试(python tests/test_delay.py)
+│   └── test_incompatible.py # 禁配装箱模式测试(校验/精确求解/快照沿用)
 ├── Dockerfile
 ├── docker-compose.yml # 含 SQLite 初始化与 handover-data 持久化卷
 ├── .env.example
