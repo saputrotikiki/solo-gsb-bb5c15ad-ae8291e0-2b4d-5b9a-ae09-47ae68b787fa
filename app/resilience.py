@@ -166,6 +166,43 @@ def _run_scenario(
     }
 
 
+def _run_scenario_safe(
+    payload: dict[str, Any],
+    baseline: dict[str, Any],
+    seg: dict[str, Any],
+    zone_idx: int,
+) -> dict[str, Any]:
+    """执行单个故障场景;禁配模式下场景可能彻底无解(plan 抛 ValueError),
+    此时视为不可运输,全部已装批次变为未装载,并把无解原因作为首个冲突原因。"""
+    try:
+        return _run_scenario(payload, baseline, seg, zone_idx)
+    except ValueError as exc:
+        zone = seg["zones"][zone_idx]
+        base_summary = baseline["summary"]
+        baseline_loaded = _loaded_units_by_batch(baseline)
+        names = _batch_names(payload)
+        newly = _newly_unloaded(baseline_loaded, {}, names)
+        newly_units = sum(n["units"] for n in newly)
+        return {
+            "segment_no": seg["no"],
+            "segment_name": seg["name"],
+            "zone_index": zone_idx + 1,
+            "zone_name": zone["name"],
+            "zone": {
+                "name": zone["name"],
+                "t_min": zone["t_min"],
+                "t_max": zone["t_max"],
+            },
+            "transportable": False,
+            "boxes_used": 0,
+            "extra_boxes": -base_summary["boxes_used"],
+            "loaded_units": 0,
+            "newly_unloaded": newly,
+            "newly_unloaded_units": newly_units,
+            "first_conflict_reason": str(exc),
+        }
+
+
 def assess_zone_failures(payload: dict[str, Any]) -> dict[str, Any]:
     """单温区故障容灾评估入口;输入不合法时抛 ValueError(与 plan 一致)。"""
     # 基准方案:与 /api/plan 完全相同的规则,且评估过程不修改该结果
@@ -173,7 +210,7 @@ def assess_zone_failures(payload: dict[str, Any]) -> dict[str, Any]:
     base_summary = baseline["summary"]
 
     scenarios = [
-        _run_scenario(payload, baseline, seg, zone_idx)
+        _run_scenario_safe(payload, baseline, seg, zone_idx)
         for seg in _segments_of(payload)
         for zone_idx in range(len(seg["zones"]))
     ]
@@ -197,7 +234,12 @@ def assess_zone_failures(payload: dict[str, Any]) -> dict[str, Any]:
             "all_transportable": base_summary["all_transportable"],
             "transport_hours": base_summary["transport_hours"],
             "segment_mode": base_summary["segment_mode"],
+            "forbidden_mode": bool(base_summary.get("forbidden_mode")),
+            "forbidden_pair_count": base_summary.get("forbidden_pair_count", 0),
         },
+        "forbidden_mode": bool(base_summary.get("forbidden_mode")),
+        "forbidden_pairs": baseline.get("forbidden_pairs") or [],
+        "forbidden_pair_count": base_summary.get("forbidden_pair_count", 0),
         "scenarios": scenarios,
         "summary": {
             "scenario_count": len(scenarios),

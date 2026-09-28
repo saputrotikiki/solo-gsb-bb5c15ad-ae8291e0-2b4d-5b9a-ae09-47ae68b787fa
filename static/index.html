@@ -47,6 +47,12 @@
         <small>(总运输时长 = 各段时长之和)</small>
       </label>
 
+      <label class="seg-toggle forbidden-toggle">
+        <input type="checkbox" id="forbiddenMode" />
+        启用禁配装箱模式:货物行可填不可同箱的其他批号(当前列表序号,逗号分隔),单向填写视为双方禁配
+        <small>(启用时总件数限 1~10 件;精确求解箱数最少、并列时箱号序列字典序最小的全员方案;无解不返回部分方案)</small>
+      </label>
+
       <div id="singleZoneSection">
         <div class="section-head">
           <h2>允许温区</h2>
@@ -83,7 +89,8 @@
               <th>首选下限 ℃<br><small>(可选)</small></th>
               <th>首选上限 ℃<br><small>(可选)</small></th>
               <th>度时预算 ℃·h<br><small>(留空不限)</small></th>
-              <th>最长运输 h<br><small>(留空不限)</small></th><th></th>
+              <th>最长运输 h<br><small>(留空不限)</small></th>
+              <th class="col-forbidden">禁配批号<br><small>(逗号分隔,仅禁配模式)</small></th><th></th>
             </tr>
           </thead>
           <tbody id="cargoRows"></tbody>
@@ -102,6 +109,7 @@
         <div id="summary" class="summary"></div>
 
         <h3>分箱方案 <span id="boxCount" class="muted"></span></h3>
+        <div id="forbiddenBanner" class="assess-meta forbidden-banner" hidden></div>
         <div id="boxes" class="box-list"></div>
 
         <h3 id="unloadedTitle" class="conflict-title" hidden>未能装载的货物与冲突原因</h3>

@@ -47,6 +47,12 @@ class CargoIn(BaseModel):
     max_transport_hours: float | None = Field(
         None, ge=0, description="该批货物可承受的最长运输时长(小时),留空表示不限"
     )
+    forbidden_with: str | None = Field(
+        None,
+        description="禁配批号(仅在 forbidden_mode=true 启用禁配装箱模式时生效):"
+        "当前列表序号(1 起),逗号分隔,如 2,5;单向填写即视为双方禁配,"
+        "不得填写自身序号或不存在的批号;启用模式时全部货物总件数限 1~10",
+    )
 
 
 class PlanRequest(BaseModel):
@@ -69,6 +75,15 @@ class PlanRequest(BaseModel):
         "提供后启用分段温区校验,并忽略 zones",
     )
     cargoes: list[CargoIn] = Field(..., min_length=1, description="货物批次列表")
+    forbidden_mode: bool = Field(
+        False,
+        description="是否启用禁配装箱模式:启用后全部货物总件数限 1~10,"
+        "同批允许逐件拆箱,任何箱不得同时装入禁配双方,并须通过现有容量、"
+        "逐段温区、锁温组及度时预算校验;在最大箱数内存在全员装载方案时"
+        "必须返回箱数最少且(并列时)按输入批次逐件顺序组成的箱号序列"
+        "字典序最小的方案;无解时返回 400,不返回部分方案。"
+        "未启用(false)时保留原 First-Fit-Decreasing 规划",
+    )
 
 
 class ReviewRequest(BaseModel):

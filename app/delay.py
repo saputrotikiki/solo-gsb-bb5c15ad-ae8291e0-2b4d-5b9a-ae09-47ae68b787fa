@@ -131,6 +131,11 @@ def simulate_delay(payload: dict[str, Any]) -> dict[str, Any]:
     if not baseline["boxes"]:
         raise ValueError("当前方案没有任何已装箱货物,无法进行运输延误推演")
 
+    # 禁配装箱模式:规划失败(如禁配无解)已在 plan() 处抛错;这里沿用模式与
+    # 禁配快照,确保延误推演与生成方案时的装箱约束完全一致(不重新装箱)。
+    forbidden_mode = bool(baseline["summary"].get("forbidden_mode"))
+    forbidden_pairs = baseline.get("forbidden_pairs") or []
+
     base_segments = _build_segments(seg_rows)
     delayed_segments = copy.deepcopy(base_segments)
     delayed_segments[seg_no - 1].hours = _r(
@@ -343,6 +348,9 @@ def simulate_delay(payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "input_fingerprint": input_fingerprint(plan_input),
+        "forbidden_mode": forbidden_mode,
+        "forbidden_pairs": forbidden_pairs,
+        "forbidden_pair_count": len(forbidden_pairs),
         "delay": {
             "segment_no": seg_no,
             "segment_name": str(seg_rows[seg_no - 1]["name"]),

@@ -151,6 +151,7 @@ function addCargoRow(c = {}) {
     zoneCell(c.preferred_t_max ?? "", "首选上限", "number"),
     `<input type="number" step="any" min="0" value="${c.max_degree_hours ?? ""}" placeholder="不限" />`,
     `<input type="number" step="any" min="0" value="${c.max_transport_hours ?? ""}" placeholder="不限" />`,
+    `<input class="cargo-forbidden" type="text" value="${c.forbidden_with ?? ""}" placeholder="如 2,5" title="禁配批号:当前列表序号(1 起),逗号分隔;单向填写视为双方禁配;仅在启用禁配装箱模式时生效" />`,
     '<button type="button" class="btn btn-del">删除</button>',
   ]);
 }
@@ -231,7 +232,7 @@ function collectInput() {
   const zones = useSeg ? [] : readZones($("zoneRows"));
   const segments = useSeg ? collectSegments() : [];
 
-  const cargoes = readRows($("cargoRows"), 9, [
+  const cargoes = readRows($("cargoRows"), 10, [
     { key: "name", label: "名称" },
     { key: "units", label: "件数", numeric: true },
     { key: "unit_volume", label: "单件体积", numeric: true },
@@ -241,6 +242,7 @@ function collectInput() {
     { key: "preferred_t_max", label: "首选温度上限", numeric: false },
     { key: "max_degree_hours", label: "度时预算", numeric: false },
     { key: "max_transport_hours", label: "最长运输时长", numeric: false },
+    { key: "forbidden_with", label: "禁配批号", numeric: false },
   ]).map((c, i) => ({
     ...c,
     name: c.name || `批次 ${i + 1}`,
@@ -252,6 +254,10 @@ function collectInput() {
 
   if (!useSeg && zones.length === 0) throw new Error("请至少添加一个允许温区");
   if (cargoes.length === 0) throw new Error("请至少添加一批货物");
+  const forbiddenMode = $("forbiddenMode").checked;
+  const totalUnits = cargoes.reduce((s, c) => s + c.units, 0);
+  if (forbiddenMode && (totalUnits < 1 || totalUnits > 10))
+    throw new Error(`禁配装箱模式要求全部货物总件数在 1~10 件之间,当前总件数为 ${totalUnits} 件`);
   for (const c of cargoes) {
     if (c.units <= 0) throw new Error(`货物「${c.name}」件数必须大于 0`);
     if (c.unit_volume <= 0) throw new Error(`货物「${c.name}」单件体积必须大于 0`);
@@ -267,6 +273,21 @@ function collectInput() {
     }
     if (c.max_transport_hours !== null && c.max_transport_hours < 0)
       throw new Error(`货物「${c.name}」最长运输时长不能为负`);
+    c.forbidden_with = (c.forbidden_with || "").trim();
+    if (forbiddenMode && c.forbidden_with !== "") {
+      const idx = cargoes.indexOf(c) + 1;
+      const tokens = c.forbidden_with.split(/[,，;；\s]+/).filter(Boolean);
+      for (const tok of tokens) {
+        if (!/^\d+$/.test(tok))
+          throw new Error(`货物「${c.name}」的禁配批号 ${tok} 非法,请填写 1~${cargoes.length} 的列表序号(逗号分隔)`);
+        const other = Number(tok);
+        if (other < 1 || other > cargoes.length)
+          throw new Error(`货物「${c.name}」的禁配批号 ${other} 超出范围,当前共 ${cargoes.length} 批货物,批号须为 1~${cargoes.length}`);
+        if (other === idx)
+          throw new Error(`货物「${c.name}」不得将自身序号 ${other} 填为禁配批号`);
+      }
+    }
+    if (!forbiddenMode) c.forbidden_with = null;
   }
 
   return {
@@ -278,6 +299,7 @@ function collectInput() {
     zones,
     segments,
     cargoes,
+    forbidden_mode: forbiddenMode,
   };
 }
 
@@ -294,7 +316,11 @@ function renderSummary(s, unit) {
   const statusText = s.all_loaded
     ? s.segment_mode ? "✓ 全程可运输" : "✓ 全部装载"
     : "⚠ 存在冲突";
+  const forbiddenChip = s.forbidden_mode
+    ? `<span class="assess-chip chip-forbidden" title="禁配装箱模式:精确求解箱数最少、并列时箱号序列字典序最小的全员方案">🚫 禁配装箱模式 · ${s.forbidden_pair_count} 对禁配</span>`
+    : "";
   $("summary").innerHTML = `
+    ${forbiddenChip ? `<div class="stat stat-wide"><div class="k">装箱模式</div><div class="v">${forbiddenChip}</div></div>` : ""}
     <div class="stat ${cls}"><div class="k">装载状态</div>
       <div class="v"><span class="badge ${s.all_loaded ? "badge-ok" : "badge-bad"}">
         ${statusText}</span></div></div>
@@ -503,11 +529,34 @@ function renderResult(data) {
   $("resultView").hidden = false;
   renderSummary(data.summary, data.volume_unit);
   $("boxCount").textContent = `（共 ${data.boxes.length} 箱）`;
+  renderForbiddenBanner(data);
   $("boxes").innerHTML = "";
   data.boxes.forEach((b) => renderBox(b, data.volume_unit, data.summary.segment_mode));
   renderUnloaded(data.unloaded, data.volume_unit);
   setupReview(data);
   setupDelay(data);
+}
+
+/* 禁配装箱模式横幅:对称化禁配配对 + 箱号按首次出现编号 + 逐件箱号序列 */
+function renderForbiddenBanner(data) {
+  const el = $("forbiddenBanner");
+  if (!data.forbidden_mode) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  const pairs = data.forbidden_pairs || [];
+  const pairText = pairs.length
+    ? pairs.map((p) => `#${p.a} ${escapeHtml(p.a_name)} ↔ #${p.b} ${escapeHtml(p.b_name)}`).join("; ")
+    : "未填写禁配关系(仅按容量/温区/预算求解)";
+  const seq = (data.forbidden_box_sequence || []).join(" ");
+  el.hidden = false;
+  el.innerHTML = `
+    <span class="assess-chip chip-forbidden">🚫 禁配装箱模式</span>
+    <span class="assess-chip">禁配配对(单向填写已视为双方):${escapeHtml(pairText)}</span>
+    <span class="assess-chip" title="按输入批次逐件顺序组成的箱号序列;并列方案中取其字典序最小者">
+      最少箱数 <strong>${data.boxes.length}</strong> · 逐件箱号序列:<strong>${seq}</strong>
+    </span>`;
 }
 
 function showError(msg) {
@@ -583,6 +632,7 @@ function renderAssessment(data) {
   $("assessMeta").innerHTML = `
     <span class="assess-chip">基准方案: ${b.boxes_used} 箱 · 已装 ${fmt(b.loaded_units)} 件
       ${b.all_transportable ? "· ✓ 全程可运输" : "· ⚠ 基准已存在冲突"}</span>
+    ${b.forbidden_mode ? `<span class="assess-chip chip-forbidden">🚫 禁配装箱模式 · ${b.forbidden_pair_count} 对禁配</span>` : ""}
     <span class="assess-chip">场景数: ${sm.scenario_count}</span>
     <span class="assess-chip ${sm.failed_count ? "chip-bad" : "chip-ok"}">不可运输: ${sm.failed_count}</span>
     <span class="assess-chip ${sm.max_extra_boxes > 0 ? "chip-warn" : ""}">最大额外箱数: +${fmt(sm.max_extra_boxes)}</span>
@@ -1011,6 +1061,7 @@ $("btnSample").addEventListener("click", () => {
   $("volumeUnit").value = SAMPLE.volume_unit;
   $("useSegments").checked = !!SAMPLE.use_segments;
   toggleSegmentMode();
+  $("forbiddenMode").checked = !!SAMPLE.forbidden_mode;
   $("zoneRows").innerHTML = "";
   $("cargoRows").innerHTML = "";
   $("segmentList").innerHTML = "";
@@ -1136,6 +1187,7 @@ function renderHandover() {
     <span class="assess-chip">应交 <strong>${s.total_due_units}</strong> 件</span>
     <span class="assess-chip chip-ok">净签收 <strong>${s.net_signed_units}</strong> 件</span>
     <span class="assess-chip ${s.pending_units === 0 ? "chip-ok" : "chip-warn"}">待交 <strong>${s.pending_units}</strong> 件</span>
+    ${currentOrder.forbidden_mode ? `<span class="assess-chip chip-forbidden">🚫 禁配装箱模式 · ${currentOrder.forbidden_pair_count} 对禁配(已随单冻结)</span>` : ""}
     <span class="assess-chip muted">记录 ${s.record_count} 条(有效 ${s.active_record_count} · 已撤销 ${s.voided_record_count}) · 快照 ${currentOrder.input_fingerprint.slice(0, 8)}</span>`;
 
   $("handoverItems").innerHTML = `
@@ -1385,6 +1437,7 @@ function renderDelay(data) {
     <span class="assess-chip">第 ${d.segment_no} 段「${escapeHtml(d.segment_name)}」新增 ${fmt(d.extra_hours)} h</span>
     <span class="assess-chip">总时长 ${fmt(th.original)} → <strong>${fmt(th.delayed)}</strong> h（+${fmt(th.delta)}）</span>
     <span class="assess-chip">推演箱数 ${sm.box_count}</span>
+    ${data.forbidden_mode ? `<span class="assess-chip chip-forbidden">🚫 禁配装箱模式 · ${data.forbidden_pair_count} 对禁配(沿用快照,不重新装箱)</span>` : ""}
     <span class="assess-chip muted">快照 ${data.input_fingerprint.slice(0, 8)}</span>`;
   let headNote;
   if (data.can_continue) {

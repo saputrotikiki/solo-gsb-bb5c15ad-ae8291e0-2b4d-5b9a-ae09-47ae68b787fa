@@ -123,6 +123,37 @@ def _replay(
     return nets, None, 0, 0
 
 
+def _forbidden_snapshot(plan_input: dict[str, Any]) -> dict[str, Any]:
+    """从存储的规划输入提取禁配装箱模式与对称化禁配配对快照。"""
+    if not plan_input.get("forbidden_mode"):
+        return {
+            "forbidden_mode": False,
+            "forbidden_pairs": [],
+            "forbidden_pair_count": 0,
+        }
+    # 复用规划器解析规则(对称闭包、非法/自身批号拒绝),保证快照口径一致
+    from .planner import _parse_forbidden_pairs  # 局部导入避免循环
+
+    class _B:  # 轻量适配 _parse_forbidden_pairs 所需字段
+        def __init__(self, no: int, name: str, raw: Any):
+            self.no, self.name, self.forbidden_raw = no, name, raw
+
+    batches = [
+        _B(i + 1, str(c.get("name") or f"批次 {i + 1}"), c.get("forbidden_with"))
+        for i, c in enumerate(plan_input.get("cargoes") or [])
+    ]
+    pairs = _parse_forbidden_pairs(batches)
+    names = {b.no: b.name for b in batches}
+    return {
+        "forbidden_mode": True,
+        "forbidden_pairs": [
+            {"a": a, "b": b, "a_name": names[a], "b_name": names[b]}
+            for a, b in pairs
+        ],
+        "forbidden_pair_count": len(pairs),
+    }
+
+
 def create_order(plan_input: dict[str, Any]) -> dict[str, Any]:
     """按规划输入快照创建交接单,冻结各箱各批次应交件数。"""
     result = plan(plan_input)  # 输入非法时抛 ValueError,由入口统一转 400
@@ -172,7 +203,8 @@ def list_orders() -> list[dict[str, Any]]:
     """交接单列表(按创建顺序),附应交/净签收/待交汇总。"""
     conn = db.get_conn()
     rows = conn.execute(
-        "SELECT id, created_at, input_fingerprint FROM handover_orders ORDER BY id"
+        "SELECT id, created_at, input_fingerprint, plan_input "
+        "FROM handover_orders ORDER BY id"
     ).fetchall()
     out = []
     for row in rows:
@@ -185,6 +217,7 @@ def list_orders() -> list[dict[str, Any]]:
         )
         total_due = sum(i["due_units"] for i in items)
         total_net = sum(nets.values())
+        fb = _forbidden_snapshot(json.loads(row["plan_input"]))
         out.append(
             {
                 "id": order_id,
@@ -197,6 +230,8 @@ def list_orders() -> list[dict[str, Any]]:
                 "pending_units": total_due - total_net,
                 "record_count": len(records),
                 "active_record_count": sum(1 for r in records if not r["voided"]),
+                "forbidden_mode": fb["forbidden_mode"],
+                "forbidden_pair_count": fb["forbidden_pair_count"],
             }
         )
     return out
@@ -237,11 +272,16 @@ def get_order(order_id: int) -> dict[str, Any]:
 
     total_due = sum(i["due_units"] for i in items_out)
     total_net = sum(i["net_signed_units"] for i in items_out)
+    plan_input = json.loads(order["plan_input"])
+    fb = _forbidden_snapshot(plan_input)
     return {
         "id": order["id"],
         "created_at": order["created_at"],
         "input_fingerprint": order["input_fingerprint"],
-        "plan_input": json.loads(order["plan_input"]),
+        "plan_input": plan_input,
+        "forbidden_mode": fb["forbidden_mode"],
+        "forbidden_pairs": fb["forbidden_pairs"],
+        "forbidden_pair_count": fb["forbidden_pair_count"],
         "items": items_out,
         "records": records_out,
         "summary": {

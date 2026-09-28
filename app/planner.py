@@ -21,11 +21,19 @@
 - 同一批货物可按"件"为最小单位拆分到多个箱子。
 - 采用 First-Fit-Decreasing 启发式:温度下限越低(要求越苛刻)的批次优先,
   同温限按总体积降序;依次塞入已有箱子,放不下再开新箱。
+- 禁配装箱模式(forbidden_mode=true):货物行可填不可同箱的其他批号(当前列表
+  序号,逗号分隔),单向填写视为双方禁配;非法批号或自身引用拒绝。启用时
+  总件数限 1~10,同批允许逐件拆箱,任何箱不得同时装入禁配双方,并须通过
+  现有容量、逐段温区、锁温组及度时预算校验。规划器做精确搜索而非启发式:
+  在最大箱数内存在全员装载方案时必须找到箱数最少者;箱号按首次出现编号,
+  并列时取按输入批次逐件顺序组成的箱号序列字典序最小者。无解时抛 ValueError
+  明确提示,不返回部分方案。未启用时保留原 FFD 规划。
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -171,13 +179,16 @@ class _Box:
     index: int
     capacity: float
     segments: list[_Segment]
+    # 禁配装箱模式下的禁配邻接表:批号 -> 与之不可同箱的批号集合;空 dict 表示
+    # 不启用该约束(原 FFD 规划路径)
+    forbidden: dict[int, set[int]] = field(default_factory=dict)
     used: float = 0.0
     items: list[_Loaded] = field(default_factory=list)
     # 已装入货物允许温区的交集;首件货物装入时初始化
     feasible: _Iv | None = None
     # 箱内批次(按批号去重),用于热暴露核算
     lots: list["_Batch"] = field(default_factory=list)
-    # 最近一次 try_load 失败原因:capacity / temp / lock / budget
+    # 最近一次 try_load 失败原因:capacity / temp / lock / budget / forbidden
     last_fail: str | None = None
 
     def try_load(self, batch: "_Batch", iv: _Iv) -> bool:
@@ -185,6 +196,13 @@ class _Box:
         self.last_fail = None
         if self.used + batch.unit_volume > self.capacity + EPS:
             self.last_fail = "capacity"
+            return False
+        # 禁配装箱:箱内已有该批的任一禁配批次时不得装入
+        forbids = self.forbidden.get(batch.no)
+        if forbids is not None and any(
+            lot.no in forbids for lot in self.lots
+        ):
+            self.last_fail = "forbidden"
             return False
         new_feasible = iv if self.feasible is None else self.feasible.intersect(iv)
         if new_feasible is None:
@@ -237,6 +255,28 @@ class _Box:
             return False
         return True
 
+    def snapshot(self) -> dict[str, Any]:
+        """箱状态快照:供禁配模式精确搜索回溯(try_load 的逆操作)。"""
+        return {
+            "used": self.used,
+            "items": len(self.items),
+            "last_units": self.items[-1].units if self.items else 0,
+            "last_volume": self.items[-1].volume if self.items else 0.0,
+            "feasible": self.feasible,
+            "lots": len(self.lots),
+        }
+
+    def restore(self, snap: dict[str, Any]) -> None:
+        """恢复到 snapshot() 记录的状态。"""
+        self.used = snap["used"]
+        del self.items[snap["items"]:]
+        if self.items:
+            self.items[-1].units = snap["last_units"]
+            self.items[-1].volume = snap["last_volume"]
+        self.feasible = snap["feasible"]
+        del self.lots[snap["lots"]:]
+        self.last_fail = None
+
 
 @dataclass
 class _Batch:
@@ -249,6 +289,8 @@ class _Batch:
     pref: _Iv | None
     budget: float | None
     total_volume: float
+    # 禁配装箱模式下该批填写的禁配批号原文(None/空串表示未填)
+    forbidden_raw: Any = None
 
 
 def _fmt_names(names: list[str]) -> str:
@@ -356,120 +398,251 @@ def _parse_zones(raw_zones: list[dict[str, Any]], ctx: str) -> list[_Zone]:
     return zones
 
 
-def plan(payload: dict[str, Any]) -> dict[str, Any]:
-    """根据请求 payload 生成分箱方案;输入不合法时抛 ValueError。"""
-    box_capacity = float(payload.get("box_capacity", 0))
-    max_boxes = int(payload.get("max_boxes", 100))
-    volume_unit = str(payload.get("volume_unit") or "体积单位").strip() or "体积单位"
+def _parse_forbidden_pairs(batches: list[_Batch]) -> list[tuple[int, int]]:
+    """解析各批填写的禁配批号,构造对称禁配关系(单向填写视为双方禁配)。
 
-    if box_capacity <= 0:
-        raise ValueError("箱体容量必须大于 0")
-    if max_boxes <= 0:
-        raise ValueError("最大箱数必须大于 0")
-
-    th_raw = payload.get("transport_hours")
-    raw_segments = payload.get("segments") or []
-    segment_mode = bool(raw_segments)
-
-    segments: list[_Segment] = []
-    if segment_mode:
-        # 分段运输:总时长为各段时长之和;显式给的 transport_hours 必须一致
-        total_hours = 0.0
-        for i, s in enumerate(raw_segments):
-            name = str(s.get("name") or f"第 {i + 1} 段").strip() or f"第 {i + 1} 段"
-            hours = float(s["hours"])
-            if hours <= 0:
-                raise ValueError(f"运输段 {name} 的时长必须大于 0")
-            zones = _parse_zones(s.get("zones") or [], f"运输段 {name} 的")
-            if not zones:
-                raise ValueError(f"运输段 {name} 至少需要定义一个可用温区")
-            # 锁温组:相邻且同组的段共用一个设定点;留空表示不参与
-            lock_group = str(s.get("lock_group") or "").strip() or None
-            segments.append(
-                _Segment(
-                    no=i + 1,
-                    name=name,
-                    hours=hours,
-                    zones=zones,
-                    lock_group=lock_group,
-                )
+    输入为当前列表序号(1 起),支持中英文逗号/空白分隔;非法批号(非正整数、
+    超出 1..批次数)或自身引用一律抛 ValueError。返回按 (a, b) 升序、
+    a < b 的去重禁配对列表。
+    """
+    n = len(batches)
+    adj: dict[int, set[int]] = {b.no: set() for b in batches}
+    for b in batches:
+        raw = b.forbidden_raw
+        if raw is None:
+            continue
+        if not isinstance(raw, str):
+            raise ValueError(
+                f"禁配装箱模式:货物 {b.name} 的禁配批号须为逗号分隔的列表序号字符串"
             )
-            total_hours += hours
-        total_hours = _r(total_hours)
-        if th_raw not in (None, ""):
-            th = float(th_raw)
-            if th < 0:
-                raise ValueError("运输时长不能为负数")
-            if abs(th - total_hours) > 1e-6:
+        text = raw.strip()
+        if not text:
+            continue
+        for part in re.split(r"[,，;；\s]+", text):
+            token = part.strip()
+            if not token:
+                continue
+            if not token.isdigit():
                 raise ValueError(
-                    f"运输时长 {_r(th)}h 与各运输段时长之和 {_r(total_hours)}h "
-                    f"不一致,请修正,或留空自动按段时长求和"
+                    f"禁配装箱模式:货物 {b.name} 填写的禁配批号 {token!r} 非法,"
+                    f"请填写 1~{n} 的列表序号(逗号分隔)"
                 )
-        transport_hours = total_hours
-    else:
-        # 兼容模式:全程单一温区,视为唯一运输段
-        transport_hours = 0.0 if th_raw in (None, "") else float(th_raw)
-        if transport_hours < 0:
-            raise ValueError("运输时长不能为负数")
-        zones = _parse_zones(payload.get("zones") or [], "")
-        if not zones:
-            raise ValueError("至少需要定义一个允许温区")
-        segments.append(
-            _Segment(no=1, name="全程", hours=transport_hours, zones=zones)
-        )
+            other = int(token)
+            if not 1 <= other <= n:
+                raise ValueError(
+                    f"禁配装箱模式:货物 {b.name} 填写的禁配批号 {other} 超出范围,"
+                    f"当前共 {n} 批货物,批号须为 1~{n} 的列表序号"
+                )
+            if other == b.no:
+                raise ValueError(
+                    f"禁配装箱模式:货物 {b.name} 不得将自身序号 {other} 填为禁配批号"
+                )
+            adj[b.no].add(other)
+    # 对称闭包:单向填写视为双方禁配
+    pairs: set[tuple[int, int]] = set()
+    for no, others in adj.items():
+        for other in others:
+            pairs.add((min(no, other), max(no, other)))
+    return sorted(pairs)
 
-    batches: list[_Batch] = []
-    for i, c in enumerate(payload.get("cargoes") or []):
-        name = str(c.get("name") or f"批次 {i + 1}")
-        lo, hi = float(c["t_min"]), float(c["t_max"])
-        if lo > hi + EPS:
-            raise ValueError(f"货物 {name} 的允许温度下限高于上限")
-        units = int(c["units"])
-        unit_volume = float(c["unit_volume"])
-        if units <= 0:
-            raise ValueError(f"货物 {name} 的件数必须大于 0")
-        if unit_volume <= 0:
-            raise ValueError(f"货物 {name} 的单件体积必须大于 0")
-        mh = c.get("max_transport_hours")
-        max_hours = None if mh in (None, "", 0, "0") else float(mh)
-        if max_hours is not None and max_hours < 0:
-            raise ValueError(f"货物 {name} 的最长运输时长不能为负数")
-        # 首选温度区间(与度时预算配合使用);下限/上限需同时填写
-        p_lo_raw, p_hi_raw = c.get("preferred_t_min"), c.get("preferred_t_max")
-        pref: _Iv | None = None
-        if (p_lo_raw in (None, "")) != (p_hi_raw in (None, "")):
-            raise ValueError(f"货物 {name} 的首选温度区间需同时填写下限和上限")
-        if p_lo_raw not in (None, ""):
-            p_lo, p_hi = float(p_lo_raw), float(p_hi_raw)
-            if p_lo > p_hi + EPS:
-                raise ValueError(f"货物 {name} 的首选温度下限高于上限")
-            pref = _Iv(p_lo, p_hi)
-        # 最大度时预算(℃·h);留空表示不限,该批保持原规则
-        mb = c.get("max_degree_hours")
-        budget = None if mb in (None, "") else float(mb)
-        if budget is not None:
-            if budget < 0:
-                raise ValueError(f"货物 {name} 的度时预算不能为负数")
-            if pref is None:
-                raise ValueError(
-                    f"货物 {name} 填写了度时预算,请同时填写首选温度区间"
-                )
-        batches.append(
-            _Batch(
-                no=i + 1,
-                name=name,
-                units=units,
-                unit_volume=unit_volume,
-                iv=_Iv(lo, hi),
-                max_hours=max_hours,
-                pref=pref,
-                budget=budget,
-                total_volume=_r(units * unit_volume),
+
+def _pairs_to_adj(pairs: list[tuple[int, int]]) -> dict[int, set[int]]:
+    """禁配对列表 -> 邻接表。"""
+    adj: dict[int, set[int]] = {}
+    for a, b in pairs:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    return adj
+
+
+def _solo_infeasible_reason(
+    batch: _Batch,
+    box_capacity: float,
+    volume_unit: str,
+    segments: list[_Segment],
+    transport_hours: float,
+    segment_mode: bool,
+) -> str | None:
+    """禁配模式预检查:该批单件独占一箱是否可行;不可行返回原因,可行返回 None。
+
+    独占都不可行时,任何拼箱(可行交集只会收窄)均不可用,直接判定无解。
+    """
+    if batch.max_hours is not None and transport_hours > batch.max_hours + EPS:
+        return (
+            f"货物 {batch.name}(批号 {batch.no})的运输时长 {_r(transport_hours)}h "
+            f"超过允许的 {_r(batch.max_hours)}h,即使独占一箱也无法保证全程温度"
+        )
+    if batch.unit_volume > box_capacity + EPS:
+        return (
+            f"货物 {batch.name}(批号 {batch.no})的单件体积 {_r(batch.unit_volume)} "
+            f"{volume_unit} 超过单箱容量 {_r(box_capacity)} {volume_unit},任何箱子均无法装载"
+        )
+    failed_seg = _first_failed_segment(segments, batch.iv)
+    if failed_seg is not None:
+        if segment_mode:
+            return (
+                f"货物 {batch.name}(批号 {batch.no})的允许温区 "
+                f"[{_r(batch.iv.lo)}, {_r(batch.iv.hi)}]℃ 与运输段「{failed_seg.name}」"
+                f"(第 {failed_seg.no} 段)的可用温区均无交集,即使独占一箱也不可运输"
             )
+        return (
+            f"货物 {batch.name}(批号 {batch.no})的允许温区 "
+            f"[{_r(batch.iv.lo)}, {_r(batch.iv.hi)}]℃ 与全部可用温区均无交集,"
+            f"即使独占一箱也不可运输"
         )
-    if not batches:
-        raise ValueError("至少需要录入一批货物")
+    failed_lock = _first_failed_lock_run(segments, batch.iv)
+    if failed_lock is not None:
+        group_name, run_segs = failed_lock
+        seg_desc = "、".join(f"第 {s.no} 段「{s.name}」" for s in run_segs)
+        return (
+            f"货物 {batch.name}(批号 {batch.no})在锁温组「{group_name}」({seg_desc})"
+            f"不存在共享设定点,即使独占一箱也不可运输"
+        )
+    if batch.budget is not None:
+        sim = _simulate_heat(segments, batch.iv, [batch])
+        if not sim["ok"]:
+            first_no = sim["first_exceeded"].get(batch.no)
+            first_seg = segments[first_no - 1] if first_no else None
+            exceeded_note = (
+                f"(首次超限:第 {first_seg.no} 段「{first_seg.name}」)"
+                if first_seg
+                else ""
+            )
+            return (
+                f"货物 {batch.name}(批号 {batch.no})按逐段最优设定点独占一箱时,"
+                f"全程累计热暴露 {_r(sim['exposures'][batch.no])} ℃·h 已超过度时预算 "
+                f"{_r(batch.budget)} ℃·h{exceeded_note},任何拼箱组合只会更差"
+            )
+    return None
 
+
+def _solve_forbidden(
+    batches: list[_Batch],
+    pairs: list[tuple[int, int]],
+    box_capacity: float,
+    max_boxes: int,
+    segments: list[_Segment],
+) -> list[_Box] | None:
+    """禁配装箱精确搜索:返回不超过 max_boxes 箱的全员装载方案,无解返回 None。
+
+    按输入批次逐件顺序(批号升序、同批逐件)放置每件货物;箱号在首次开新箱时
+    按出现顺序分配。对固定箱数 K 做深度优先搜索,箱子按 0..K-1 顺序尝试,
+    因此首次找到的方案即该 K 下箱号序列字典序最小者;K 从 1 递增到 max_boxes,
+    首个可行 K 即箱数最少者。同批连续两件对内容相同的箱子(同样的占用体积、
+    可行交集、在箱批次集合)是等价的,跳过对称分支;并以
+    (件下标, 各箱占用, 各箱可行区间, 各箱批次集合, 剩余空箱数)记忆失败状态。
+    """
+    adj = _pairs_to_adj(pairs)
+    # 逐件展开的放置序列:批号升序、同批 units 件
+    units_seq: list[_Batch] = [b for b in batches for _ in range(b.units)]
+
+    def search(k: int) -> list[_Box] | None:
+        boxes = [
+            _Box(
+                index=i + 1,
+                capacity=box_capacity,
+                segments=segments,
+                forbidden=adj,
+            )
+            for i in range(k)
+        ]
+        # 已开过的箱子数(下一件最多放入 box 0..opened-1,或在 opened<k 时开新箱)
+        state = {"opened": 0}
+        dead: set[tuple] = set()
+
+        def memo_key(pos: int) -> tuple:
+            parts: list[Any] = [
+                pos,
+                units_seq[pos].no,  # 当前件所属批:禁配关系随批变化,必须入键
+                k - state["opened"],
+            ]
+            for box in boxes[: state["opened"]]:
+                parts.append(round(box.used, 9))
+                parts.append(
+                    None
+                    if box.feasible is None
+                    else (round(box.feasible.lo, 9), round(box.feasible.hi, 9))
+                )
+                parts.append(tuple(sorted(lot.no for lot in box.lots)))
+            return tuple(parts)
+
+        def dfs(pos: int) -> bool:
+            if pos == len(units_seq):
+                return True
+            key = memo_key(pos)
+            if key in dead:
+                return False
+            batch = units_seq[pos]
+            seen_ok_sig: set[tuple] = set()
+            for bi in range(state["opened"]):
+                box = boxes[bi]
+                # 仅对"内容完全相同的箱子(占用、可行交集、在箱批次集合)已成功放入
+                # 当前件后失败"的分支去重;try_load 失败(装不下/禁配)的箱子不做
+                # 对称剪枝——失败只与当前件有关,同一签名的其他箱子可能本应先尝试
+                sig = (
+                    round(box.used, 9),
+                    None
+                    if box.feasible is None
+                    else (round(box.feasible.lo, 9), round(box.feasible.hi, 9)),
+                    tuple(sorted(lot.no for lot in box.lots)),
+                )
+                if sig in seen_ok_sig:
+                    continue
+                snap = box.snapshot()
+                if box.try_load(batch, batch.iv):
+                    if dfs(pos + 1):
+                        return True
+                    box.restore(snap)
+                    seen_ok_sig.add(sig)
+            if state["opened"] < k:
+                box = boxes[state["opened"]]
+                state["opened"] += 1
+                # 新开箱同样需要快照:回溯时既要卸载该件,也要撤销"已开箱"计数
+                open_snap = box.snapshot()
+                ok = box.try_load(batch, batch.iv)
+                # 独占可行性已由 _solo_infeasible_reason 预检,此处必成功
+                assert ok
+                if dfs(pos + 1):
+                    return True
+                box.restore(open_snap)
+                state["opened"] -= 1
+            dead.add(key)
+            return False
+
+        return boxes if dfs(0) else None
+
+    for k in range(1, max_boxes + 1):
+        result = search(k)
+        if result is not None:
+            return result
+    return None
+
+
+def _minimum_boxes_needed(
+    batches: list[_Batch],
+    pairs: list[tuple[int, int]],
+    box_capacity: float,
+    segments: list[_Segment],
+) -> int:
+    """忽略用户最大箱数上限,求禁配装箱实际所需最少箱数(仅用于无解提示)。"""
+    total_units = sum(b.units for b in batches)
+    result = _solve_forbidden(
+        batches, pairs, box_capacity, total_units, segments
+    )
+    return len(result) if result is not None else -1
+
+
+def _ffd_pack(
+    batches: list[_Batch],
+    *,
+    box_capacity: float,
+    max_boxes: int,
+    volume_unit: str,
+    segments: list[_Segment],
+    transport_hours: float,
+    segment_mode: bool,
+) -> tuple[list[_Box], list[dict[str, Any]]]:
+    """原规划路径:First-Fit-Decreasing 启发式装箱,返回 (箱子, 未装载明细)。"""
     boxes: list[_Box] = []
     unloaded: list[dict[str, Any]] = []
 
@@ -671,6 +844,175 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
             while remaining > 0 and box.try_load(b, b.iv):
                 remaining -= 1
 
+    return boxes, unloaded
+
+
+def plan(payload: dict[str, Any]) -> dict[str, Any]:
+    """根据请求 payload 生成分箱方案;输入不合法时抛 ValueError。"""
+    box_capacity = float(payload.get("box_capacity", 0))
+    max_boxes = int(payload.get("max_boxes", 100))
+    volume_unit = str(payload.get("volume_unit") or "体积单位").strip() or "体积单位"
+    forbidden_mode = bool(payload.get("forbidden_mode"))
+
+    if box_capacity <= 0:
+        raise ValueError("箱体容量必须大于 0")
+    if max_boxes <= 0:
+        raise ValueError("最大箱数必须大于 0")
+
+    th_raw = payload.get("transport_hours")
+    raw_segments = payload.get("segments") or []
+    segment_mode = bool(raw_segments)
+
+    segments: list[_Segment] = []
+    if segment_mode:
+        # 分段运输:总时长为各段时长之和;显式给的 transport_hours 必须一致
+        total_hours = 0.0
+        for i, s in enumerate(raw_segments):
+            name = str(s.get("name") or f"第 {i + 1} 段").strip() or f"第 {i + 1} 段"
+            hours = float(s["hours"])
+            if hours <= 0:
+                raise ValueError(f"运输段 {name} 的时长必须大于 0")
+            zones = _parse_zones(s.get("zones") or [], f"运输段 {name} 的")
+            if not zones:
+                raise ValueError(f"运输段 {name} 至少需要定义一个可用温区")
+            # 锁温组:相邻且同组的段共用一个设定点;留空表示不参与
+            lock_group = str(s.get("lock_group") or "").strip() or None
+            segments.append(
+                _Segment(
+                    no=i + 1,
+                    name=name,
+                    hours=hours,
+                    zones=zones,
+                    lock_group=lock_group,
+                )
+            )
+            total_hours += hours
+        total_hours = _r(total_hours)
+        if th_raw not in (None, ""):
+            th = float(th_raw)
+            if th < 0:
+                raise ValueError("运输时长不能为负数")
+            if abs(th - total_hours) > 1e-6:
+                raise ValueError(
+                    f"运输时长 {_r(th)}h 与各运输段时长之和 {_r(total_hours)}h "
+                    f"不一致,请修正,或留空自动按段时长求和"
+                )
+        transport_hours = total_hours
+    else:
+        # 兼容模式:全程单一温区,视为唯一运输段
+        transport_hours = 0.0 if th_raw in (None, "") else float(th_raw)
+        if transport_hours < 0:
+            raise ValueError("运输时长不能为负数")
+        zones = _parse_zones(payload.get("zones") or [], "")
+        if not zones:
+            raise ValueError("至少需要定义一个允许温区")
+        segments.append(
+            _Segment(no=1, name="全程", hours=transport_hours, zones=zones)
+        )
+
+    batches: list[_Batch] = []
+    for i, c in enumerate(payload.get("cargoes") or []):
+        name = str(c.get("name") or f"批次 {i + 1}")
+        lo, hi = float(c["t_min"]), float(c["t_max"])
+        if lo > hi + EPS:
+            raise ValueError(f"货物 {name} 的允许温度下限高于上限")
+        units = int(c["units"])
+        unit_volume = float(c["unit_volume"])
+        if units <= 0:
+            raise ValueError(f"货物 {name} 的件数必须大于 0")
+        if unit_volume <= 0:
+            raise ValueError(f"货物 {name} 的单件体积必须大于 0")
+        mh = c.get("max_transport_hours")
+        max_hours = None if mh in (None, "", 0, "0") else float(mh)
+        if max_hours is not None and max_hours < 0:
+            raise ValueError(f"货物 {name} 的最长运输时长不能为负数")
+        # 首选温度区间(与度时预算配合使用);下限/上限需同时填写
+        p_lo_raw, p_hi_raw = c.get("preferred_t_min"), c.get("preferred_t_max")
+        pref: _Iv | None = None
+        if (p_lo_raw in (None, "")) != (p_hi_raw in (None, "")):
+            raise ValueError(f"货物 {name} 的首选温度区间需同时填写下限和上限")
+        if p_lo_raw not in (None, ""):
+            p_lo, p_hi = float(p_lo_raw), float(p_hi_raw)
+            if p_lo > p_hi + EPS:
+                raise ValueError(f"货物 {name} 的首选温度下限高于上限")
+            pref = _Iv(p_lo, p_hi)
+        # 最大度时预算(℃·h);留空表示不限,该批保持原规则
+        mb = c.get("max_degree_hours")
+        budget = None if mb in (None, "") else float(mb)
+        if budget is not None:
+            if budget < 0:
+                raise ValueError(f"货物 {name} 的度时预算不能为负数")
+            if pref is None:
+                raise ValueError(
+                    f"货物 {name} 填写了度时预算,请同时填写首选温度区间"
+                )
+        batches.append(
+            _Batch(
+                no=i + 1,
+                name=name,
+                units=units,
+                unit_volume=unit_volume,
+                iv=_Iv(lo, hi),
+                max_hours=max_hours,
+                pref=pref,
+                budget=budget,
+                total_volume=_r(units * unit_volume),
+                forbidden_raw=c.get("forbidden_with"),
+            )
+        )
+    if not batches:
+        raise ValueError("至少需要录入一批货物")
+
+    # 禁配装箱模式:总件数限 1~10,解析禁配配对,精确搜索全员装载的最少箱方案
+    forbidden_pairs: list[tuple[int, int]] = []
+    if forbidden_mode:
+        total_units_in = sum(b.units for b in batches)
+        if not 1 <= total_units_in <= 10:
+            raise ValueError(
+                f"禁配装箱模式要求全部货物总件数在 1~10 件之间,"
+                f"当前总件数为 {total_units_in} 件"
+            )
+        forbidden_pairs = _parse_forbidden_pairs(batches)
+        # 单件独占预检查:独占即不可行的批次任何拼箱组合均不可用
+        for b in batches:
+            reason = _solo_infeasible_reason(
+                b, box_capacity, volume_unit, segments,
+                transport_hours, segment_mode,
+            )
+            if reason is not None:
+                raise ValueError(f"禁配装箱模式无解:{reason}")
+        boxes = _solve_forbidden(
+            batches, forbidden_pairs, box_capacity, max_boxes, segments
+        )
+        if boxes is None:
+            needed = _minimum_boxes_needed(
+                batches, forbidden_pairs, box_capacity, segments
+            )
+            if needed > 0:
+                hint = (
+                    f";放宽最大箱数到至少 {needed} 箱后存在全员装载方案"
+                    if needed > max_boxes
+                    else ""
+                )
+            else:
+                hint = ""
+            raise ValueError(
+                f"禁配装箱模式无解:在最大箱数 {max_boxes} 内不存在满足全部约束的"
+                f"全员装载方案(容量、逐段温区、锁温组、度时预算及禁配双方不同箱),"
+                f"不返回部分方案,请调整输入后重试{hint}"
+            )
+        unloaded: list[dict[str, Any]] = []
+    else:
+        boxes, unloaded = _ffd_pack(
+            batches,
+            box_capacity=box_capacity,
+            max_boxes=max_boxes,
+            volume_unit=volume_unit,
+            segments=segments,
+            transport_hours=transport_hours,
+            segment_mode=segment_mode,
+        )
+
     # 6) 组装输出
     # 段下标 -> (锁温组名, 组内段号列表),用于按段标注共享设定点
     lock_members: dict[int, tuple[str, list[int]]] = {}
@@ -829,6 +1171,28 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
         b["transportable"] for b in out_boxes
     )
 
+    # 禁配模式快照:对称化后的禁配配对,以及按输入批次逐件顺序组成的箱号序列
+    # (同批在各箱的件数按箱号升序展开);FFD 路径下为 None/空
+    names_by_no = {b.no: b.name for b in batches}
+    forbidden_pairs_out = [
+        {
+            "a": a,
+            "b": b,
+            "a_name": names_by_no[a],
+            "b_name": names_by_no[b],
+        }
+        for a, b in forbidden_pairs
+    ]
+    box_sequence: list[int] | None = None
+    if forbidden_mode:
+        box_sequence = []
+        for b in batches:
+            for box in boxes:
+                units_in_box = next(
+                    (it.units for it in box.items if it.batch_no == b.no), 0
+                )
+                box_sequence.extend([box.index] * units_in_box)
+
     return {
         "summary": {
             "total_cargo_units": total_units,
@@ -843,6 +1207,8 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
             "transport_hours": _r(transport_hours),
             "segment_mode": segment_mode,
             "all_transportable": all_transportable,
+            "forbidden_mode": forbidden_mode,
+            "forbidden_pair_count": len(forbidden_pairs),
         },
         "segments": [
             {
@@ -860,4 +1226,7 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
         "boxes": out_boxes,
         "unloaded": unloaded,
         "volume_unit": volume_unit,
+        "forbidden_mode": forbidden_mode,
+        "forbidden_pairs": forbidden_pairs_out,
+        "forbidden_box_sequence": box_sequence,
     }
